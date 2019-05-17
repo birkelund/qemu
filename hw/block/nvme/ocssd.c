@@ -1807,7 +1807,10 @@ static void ocssd_copy_out_cb(void *opaque, int ret)
         addr = req->cmd.cdw12;
         addr = (addr << 32) | req->cmd.cdw13;
         g_free((void *) addr);
-        g_free((void *) req->cmd.mptr);
+
+        if (n->params.ms) {
+            g_free((void *) req->cmd.mptr);
+        }
 
         nvme_enqueue_req_completion(cq, req);
     }
@@ -1855,15 +1858,15 @@ static void ocssd_copy_in_cb(void *opaque, int ret)
         /* second phase of copy is a write */
         req->is_write = true;
 
+        addr = req->cmd.cdw12;
+        addr = (addr << 32) | req->cmd.cdw13;
+
         status = ocssd_rw_check_vector_req(o, &req->cmd, req, NULL);
         if (status) {
             trace_ocssd_err(req->cqe.cid, "ocssd_rw_check_vector_req",
                 status);
             goto out;
         }
-
-        addr = req->cmd.cdw12;
-        addr = (addr << 32) | req->cmd.cdw13;
 
         pci_dma_sglist_init(&qsg, &n->parent_obj, 1);
         qemu_sglist_add(&qsg, addr, req->nlb * unit_len);
@@ -1909,6 +1912,12 @@ out:
         }
 
         if (status != NVME_SUCCESS) {
+            g_free((void *) addr);
+
+            if (n->params.ms) {
+                g_free((void *) req->cmd.mptr);
+            }
+
             req->status = status;
             nvme_enqueue_req_completion(cq, req);
         }
@@ -1977,7 +1986,7 @@ static uint16_t ocssd_copy(OcssdCtrl *o, NvmeCmd *cmd, NvmeRequest *req)
     }
 
     if (n->params.ms) {
-        req->cmd.mptr  = (hwaddr) g_malloc_n(req->nlb, unit_len_meta);
+        req->cmd.mptr = (hwaddr) g_malloc_n(req->nlb, unit_len_meta);
 
         qsg.nsg = 0;
         qsg.size = 0;
@@ -2013,7 +2022,11 @@ out:
 
     if (status) {
         g_free((void *) addr);
-        g_free((void *) req->cmd.mptr);
+
+        if (n->params.ms) {
+            g_free((void *) req->cmd.mptr);
+        }
+
         return status;
     }
 
