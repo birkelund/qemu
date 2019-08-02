@@ -99,6 +99,10 @@ static int nvme_ns_init_blk_zoneinfo(NvmeNamespace *ns, size_t len,
         zd->zcap = ns->params.zns.zcap;
         zone->wp_staging = zslba;
         zd->wp = zd->zslba = cpu_to_le64(zslba);
+
+        if (ns->params.zns.zdes) {
+            zone->zde = g_malloc0(nvme_ns_zdes_bytes(ns));
+        }
     }
 
     ret = nvme_ns_blk_resize(blk, len, &local_err);
@@ -128,7 +132,7 @@ static int nvme_ns_setup_blk_zoneinfo(NvmeNamespace *ns, Error **errp)
     NvmeZoneDescriptor *zd;
     BlockBackend *blk = ns->zns.info.blk;
     uint64_t perm, shared_perm;
-    int64_t len, zoneinfo_len;
+    int64_t len, zoneinfo_len, zone_len;
 
     Error *local_err = NULL;
     int ret;
@@ -142,8 +146,9 @@ static int nvme_ns_setup_blk_zoneinfo(NvmeNamespace *ns, Error **errp)
         return ret;
     }
 
-    zoneinfo_len = ROUND_UP(ns->zns.info.num_zones *
-                            sizeof(NvmeZoneDescriptor), BDRV_SECTOR_SIZE);
+    zone_len = sizeof(NvmeZoneDescriptor) + nvme_ns_zdes_bytes(ns);
+    zoneinfo_len = ROUND_UP(ns->zns.info.num_zones * zone_len,
+                            BDRV_SECTOR_SIZE);
 
     len = blk_getlength(blk);
     if (len < 0) {
@@ -177,6 +182,23 @@ static int nvme_ns_setup_blk_zoneinfo(NvmeNamespace *ns, Error **errp)
 
             zone->wp_staging = nvme_wp(zone);
 
+            if (ns->params.zns.zdes) {
+                uint16_t zde_bytes = nvme_ns_zdes_bytes(ns);
+                int64_t offset = ns->zns.info.num_zones *
+                    sizeof(NvmeZoneDescriptor);
+                ns->zns.info.zones[i].zde = g_malloc(zde_bytes);
+
+                ret = blk_pread(blk, offset + i * zde_bytes,
+                                ns->zns.info.zones[i].zde, zde_bytes);
+                if (ret < 0) {
+                    error_setg_errno(errp, -ret, "blk_pread: ");
+                    return ret;
+                } else if (ret != zde_bytes) {
+                    error_setg(errp, "blk_pread: short read");
+                    return -1;
+                }
+            }
+
             switch (nvme_zs(zone)) {
             case NVME_ZS_ZSE:
             case NVME_ZS_ZSF:
@@ -185,7 +207,8 @@ static int nvme_ns_setup_blk_zoneinfo(NvmeNamespace *ns, Error **errp)
                 continue;
 
             case NVME_ZS_ZSC:
-                if (nvme_wp(zone) == nvme_zslba(zone)) {
+                if (nvme_wp(zone) == nvme_zslba(zone) &&
+                    !NVME_ZA_ZDEV(zd->za)) {
                     nvme_zs_set(zone, NVME_ZS_ZSE);
                     continue;
                 }
@@ -231,6 +254,7 @@ static void nvme_ns_init_zoned(NvmeNamespace *ns)
 
     for (int i = 0; i <= id_ns->nlbaf; i++) {
         id_ns_zns->lbafe[i].zsze = cpu_to_le64(pow2ceil(ns->params.zns.zcap));
+        id_ns_zns->lbafe[i].zdes = ns->params.zns.zdes;
     }
 
     ns->zns.info.num_zones = nvme_ns_nlbas(ns) / nvme_ns_zsze(ns);
@@ -472,6 +496,7 @@ static Property nvme_ns_props[] = {
     DEFINE_PROP_UINT8("iocs", NvmeNamespace, params.iocs, 0x0),
     DEFINE_PROP_DRIVE("zns.zoneinfo", NvmeNamespace, zns.info.blk),
     DEFINE_PROP_UINT64("zns.zcap", NvmeNamespace, params.zns.zcap, 0),
+    DEFINE_PROP_UINT8("zns.zdes", NvmeNamespace, params.zns.zdes, 0),
     DEFINE_PROP_UINT16("zns.zoc", NvmeNamespace, params.zns.zoc, 0),
     DEFINE_PROP_UINT16("zns.ozcs", NvmeNamespace, params.zns.ozcs, 0),
     DEFINE_PROP_END_OF_LIST(),

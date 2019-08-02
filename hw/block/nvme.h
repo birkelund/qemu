@@ -47,6 +47,12 @@ static const NvmeEffectsLog nvme_effects[] = {
                 NVME_EFFECTS_LBCC,
         },
     },
+
+    [NVME_IOCS_ZONED] = {
+        .iocs = {
+            [NVME_CMD_ZONE_MGMT_RECV]   = NVME_EFFECTS_CSUPP,
+        }
+    },
 };
 
 typedef struct NvmeAsyncEvent {
