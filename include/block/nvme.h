@@ -746,6 +746,11 @@ typedef enum NvmeZoneManagementRecvActionSpecificField {
 
 #define NVME_CMD_ZONE_MGMT_RECEIVE_PARTIAL 0x1
 
+typedef struct NvmeZoneReportHeader {
+    uint64_t num_zones;
+    uint8_t  rsvd[56];
+} NvmeZoneReportHeader;
+
 typedef struct NvmeDsmCmd {
     uint8_t     opcode;
     uint8_t     flags;
