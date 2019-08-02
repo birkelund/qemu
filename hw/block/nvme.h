@@ -51,6 +51,8 @@ static const NvmeEffectsLog nvme_effects[] = {
     [NVME_IOCS_ZONED] = {
         .iocs = {
             [NVME_CMD_ZONE_MGMT_RECV]   = NVME_EFFECTS_CSUPP,
+            [NVME_CMD_ZONE_MGMT_SEND]   = NVME_EFFECTS_CSUPP |
+                NVME_EFFECTS_LBCC,
         }
     },
 };
@@ -127,6 +129,7 @@ typedef enum NvmeAIOOp {
     NVME_AIO_OPC_READ         = 0x2,
     NVME_AIO_OPC_WRITE        = 0x3,
     NVME_AIO_OPC_WRITE_ZEROES = 0x4,
+    NVME_AIO_OPC_DISCARD      = 0x5,
 } NvmeAIOOp;
 
 typedef enum NvmeAIOFlags {
@@ -164,6 +167,7 @@ static inline const char *nvme_aio_opc_str(NvmeAIO *aio)
     case NVME_AIO_OPC_READ:         return "NVME_AIO_OP_READ";
     case NVME_AIO_OPC_WRITE:        return "NVME_AIO_OP_WRITE";
     case NVME_AIO_OPC_WRITE_ZEROES: return "NVME_AIO_OP_WRITE_ZEROES";
+    case NVME_AIO_OPC_DISCARD:      return "NVME_AIO_OP_DISCARD";
     default:                        return "NVME_AIO_OP_UNKNOWN";
     }
 }
