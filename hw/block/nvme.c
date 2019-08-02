@@ -902,6 +902,116 @@ static void nvme_clear_events(NvmeCtrl *n, uint8_t event_type)
     }
 }
 
+static uint16_t nvme_check_zone_readable(NvmeCtrl *n, NvmeRequest *req,
+                                         NvmeZone *zone)
+{
+    NvmeZoneState zs = nvme_zs(zone);
+    uint64_t zslba = nvme_zslba(zone);
+
+    if (zs == NVME_ZS_ZSO) {
+        trace_pci_nvme_err_invalid_zone_condition(nvme_cid(req), zslba,
+                                                  NVME_ZS_ZSO);
+        return NVME_ZONE_IS_OFFLINE | NVME_DNR;
+    }
+
+    return NVME_SUCCESS;
+}
+
+static uint16_t nvme_check_zone_read(NvmeCtrl *n, uint64_t slba, uint32_t nlb,
+                                     NvmeRequest *req, NvmeZone *zone)
+{
+    NvmeNamespace *ns = req->ns;
+    NvmeIdNsZns *id_ns_zns = nvme_ns_id_zoned(ns);
+    uint64_t zslba = nvme_zslba(zone);
+    uint64_t zsze = nvme_ns_zsze(ns);
+    uint16_t status;
+
+    status = nvme_check_zone_readable(n, req, zone);
+    if (status) {
+        return status;
+    }
+
+    if ((slba + nlb) > (zslba + zsze)) {
+        if (!(id_ns_zns->ozcs & NVME_ID_NS_ZNS_OZCS_RAZB)) {
+            trace_pci_nvme_err_zone_boundary(nvme_cid(req), slba, nlb, zsze);
+            return NVME_ZONE_BOUNDARY_ERROR | NVME_DNR;
+        }
+    }
+
+    return NVME_SUCCESS;
+}
+
+static uint16_t nvme_check_zone_writeable(NvmeCtrl *n, NvmeRequest *req,
+                                          NvmeZone *zone)
+{
+    NvmeZoneState zs = nvme_zs(zone);
+    uint64_t zslba = nvme_zslba(zone);
+
+    if (zs == NVME_ZS_ZSO) {
+        trace_pci_nvme_err_invalid_zone_condition(nvme_cid(req), zslba,
+                                                  NVME_ZS_ZSO);
+        return NVME_ZONE_IS_OFFLINE | NVME_DNR;
+    }
+
+    switch (zs) {
+    case NVME_ZS_ZSE:
+    case NVME_ZS_ZSC:
+    case NVME_ZS_ZSIO:
+    case NVME_ZS_ZSEO:
+        return NVME_SUCCESS;
+    case NVME_ZS_ZSF:
+        trace_pci_nvme_err_zone_is_full(nvme_cid(req), req->slba);
+        return NVME_ZONE_IS_FULL | NVME_DNR;
+    case NVME_ZS_ZSRO:
+        trace_pci_nvme_err_zone_is_read_only(nvme_cid(req), req->slba);
+        return NVME_ZONE_IS_READ_ONLY | NVME_DNR;
+    default:
+        break;
+    }
+
+    trace_pci_nvme_err_invalid_zone_condition(nvme_cid(req), zslba, zs);
+    return NVME_INTERNAL_DEV_ERROR | NVME_DNR;
+}
+
+static uint16_t nvme_check_zone_write(NvmeCtrl *n, uint64_t slba, uint32_t nlb,
+                                      NvmeRequest *req, NvmeZone *zone)
+{
+    uint64_t zslba, wp, zcap;
+    uint16_t status;
+
+    zslba = nvme_zslba(zone);
+    wp = zone->wp_staging;
+    zcap = nvme_zcap(zone);
+
+    status = nvme_check_zone_writeable(n, req, zone);
+    if (status) {
+        return status;
+    }
+
+    if ((wp - zslba) + nlb > zcap) {
+        trace_pci_nvme_err_zone_boundary(nvme_cid(req), slba, nlb, zcap);
+        return NVME_ZONE_BOUNDARY_ERROR | NVME_DNR;
+    }
+
+    if (slba != wp) {
+        trace_pci_nvme_err_zone_invalid_write(nvme_cid(req), slba, wp);
+        return NVME_ZONE_INVALID_WRITE | NVME_DNR;
+    }
+
+    return NVME_SUCCESS;
+}
+
+static inline uint16_t nvme_check_rwz_zone(NvmeCtrl *n, uint64_t slba, uint32_t
+                                           nlb, NvmeRequest *req,
+                                           NvmeZone *zone)
+{
+    if (nvme_req_is_write(req)) {
+        return nvme_check_zone_write(n, slba, nlb, req, zone);
+    }
+
+    return nvme_check_zone_read(n, slba, nlb, req, zone);
+}
+
 static inline uint16_t nvme_check_mdts(NvmeCtrl *n, size_t len)
 {
     uint8_t mdts = n->params.mdts;
@@ -995,6 +1105,44 @@ static void nvme_ns_update_util(NvmeNamespace *ns, uint64_t slba,
     nvme_req_add_aio(req, aio);
 }
 
+static void nvme_update_zone_info(NvmeNamespace *ns, NvmeRequest *req,
+                                  NvmeZone *zone)
+{
+    uint64_t zslba = -1;
+
+    QEMUIOVector *iov = g_new0(QEMUIOVector, 1);
+    NvmeAIO *aio = g_new0(NvmeAIO, 1);
+
+    *aio = (NvmeAIO) {
+        .opc = NVME_AIO_OPC_WRITE,
+        .blk = ns->zns.info.blk,
+        .payload = iov,
+        .req = req,
+        .flags = NVME_AIO_INTERNAL,
+    };
+
+    qemu_iovec_init(iov, 1);
+
+    if (zone) {
+        zslba = nvme_zslba(zone);
+        trace_pci_nvme_update_zone_info(nvme_cid(req), ns->params.nsid, zslba);
+
+        aio->offset = nvme_ns_zone_idx(ns, zslba) * sizeof(NvmeZoneDescriptor);
+        qemu_iovec_add(iov, &zone->zd, sizeof(NvmeZoneDescriptor));
+    } else {
+        trace_pci_nvme_update_zone_info(nvme_cid(req), ns->params.nsid, zslba);
+
+        for (int i = 0; i < ns->zns.info.num_zones; i++) {
+            qemu_iovec_add(iov, &ns->zns.info.zones[i].zd,
+                           sizeof(NvmeZoneDescriptor));
+        }
+    }
+
+    aio->len = iov->size;
+
+    nvme_req_add_aio(req, aio);
+}
+
 static void nvme_aio_write_cb(NvmeAIO *aio, void *opaque, int ret)
 {
     NvmeRequest *req = aio->req;
@@ -1007,6 +1155,44 @@ static void nvme_aio_write_cb(NvmeAIO *aio, void *opaque, int ret)
         bitmap_set(ns->utilization, req->slba, req->nlb);
         nvme_ns_update_util(ns, req->slba, req->nlb, req);
     }
+}
+
+static void nvme_zone_advance_wp(NvmeZone *zone, uint32_t nlb,
+                                 NvmeRequest *req)
+{
+    NvmeZoneDescriptor *zd = &zone->zd;
+    uint64_t wp = nvme_wp(zone);
+    uint64_t zslba = nvme_zslba(zone);
+
+    trace_pci_nvme_zone_advance_wp(nvme_cid(req), zslba, nlb, wp, wp + nlb);
+
+    wp += nlb;
+    if (wp == zslba + nvme_zcap(zone)) {
+        nvme_zs_set(zone, NVME_ZS_ZSF);
+    }
+
+    zd->wp = cpu_to_le64(wp);
+}
+
+static void nvme_aio_zone_write_cb(NvmeAIO *aio, void *opaque, int ret)
+{
+    NvmeZone *zone = opaque;
+    NvmeRequest *req = aio->req;
+    NvmeNamespace *ns = req->ns;
+    uint32_t nlb = req->nlb;
+    uint64_t zslba = nvme_zslba(zone);
+    uint64_t wp = nvme_wp(zone);
+
+    trace_pci_nvme_aio_zone_write_cb(nvme_cid(req), zslba, nlb, wp);
+
+    if (ret) {
+        return;
+    }
+
+    nvme_aio_write_cb(aio, opaque, ret);
+    nvme_zone_advance_wp(zone, nlb, req);
+
+    nvme_update_zone_info(ns, req, zone);
 }
 
 static void nvme_rw_cb(NvmeRequest *req, void *opaque)
@@ -1045,6 +1231,7 @@ static void nvme_aio_cb(void *opaque, int ret)
         block_acct_failed(stats, acct);
 
         if (req) {
+            NvmeNamespace *ns = req->ns;
             uint16_t status;
 
             switch (aio->opc) {
@@ -1075,6 +1262,22 @@ static void nvme_aio_cb(void *opaque, int ret)
             if (!req->status || (status & 0xfff) == NVME_INTERNAL_DEV_ERROR) {
                 req->status = status;
             }
+
+            if (nvme_ns_zoned(ns)) {
+                NvmeZone *zone = nvme_ns_get_zone(ns, req->slba);
+
+                /*
+                 * Transition the zone to read-only on write fault and offline
+                 * on unrecovered read.
+                 */
+                NvmeZoneState zs = status == NVME_WRITE_FAULT ?
+                    NVME_ZS_ZSRO : NVME_ZS_ZSO;
+
+                nvme_zs_set(zone, zs);
+                NVME_ZA_CLEAR(zone->zd.za);
+
+                nvme_update_zone_info(ns, req, zone);
+            }
         }
     }
 
@@ -1098,7 +1301,8 @@ static void nvme_aio_cb(void *opaque, int ret)
 }
 
 static void nvme_aio_rw(NvmeNamespace *ns, NvmeAIOOp opc,
-                        NvmeAIOCompletionFunc *cb, NvmeRequest *req)
+                        NvmeAIOCompletionFunc *cb, void *cb_arg,
+                        NvmeRequest *req)
 {
     NvmeAIO *aio = g_new(NvmeAIO, 1);
 
@@ -1108,6 +1312,7 @@ static void nvme_aio_rw(NvmeNamespace *ns, NvmeAIOOp opc,
         .offset = req->slba << nvme_ns_lbads(ns),
         .req = req,
         .cb = cb,
+        .cb_arg = cb_arg,
     };
 
     if (req->qsg.sg) {
@@ -1138,18 +1343,17 @@ static uint16_t nvme_flush(NvmeCtrl *n, NvmeRequest *req)
     return NVME_NO_COMPLETE;
 }
 
-static uint16_t nvme_write_zeroes(NvmeCtrl *n, NvmeRequest *req)
+static uint16_t nvme_do_write_zeroes(NvmeCtrl *n, NvmeRequest *req)
 {
-    NvmeRwCmd *rw = (NvmeRwCmd *)&req->cmd;
-    NvmeNamespace *ns = req->ns;
     NvmeAIO *aio;
+    NvmeAIOCompletionFunc *cb = nvme_aio_write_cb;
+    void *cb_arg = NULL;
+
+    NvmeNamespace *ns = req->ns;
 
     int64_t offset;
     size_t count;
     uint16_t status;
-
-    req->slba = le64_to_cpu(rw->slba);
-    req->nlb  = le16_to_cpu(rw->nlb) + 1;
 
     trace_pci_nvme_write_zeroes(nvme_cid(req), nvme_nsid(ns), req->slba,
                                 req->nlb);
@@ -1157,13 +1361,40 @@ static uint16_t nvme_write_zeroes(NvmeCtrl *n, NvmeRequest *req)
     status = nvme_check_bounds(n, ns, req->slba, req->nlb);
     if (status) {
         NvmeIdNsNvm *id_ns = nvme_ns_id_nvm(ns);
-        trace_pci_nvme_err_invalid_lba_range(req->slba, req->nlb,
-                                             id_ns->nsze);
-        return status;
+        trace_pci_nvme_err_invalid_lba_range(req->slba, req->nlb, id_ns->nsze);
+
+        goto invalid;
     }
 
     offset = req->slba << nvme_ns_lbads(ns);
     count = req->nlb << nvme_ns_lbads(ns);
+
+    if (nvme_ns_zoned(ns)) {
+        NvmeZone *zone = nvme_ns_get_zone(ns, req->slba);
+        if (!zone) {
+            trace_pci_nvme_err_invalid_zone(nvme_cid(req), req->slba);
+            status = NVME_INVALID_FIELD | NVME_DNR;
+            goto invalid;
+        }
+
+        status = nvme_check_zone_write(n, req->slba, req->nlb, req, zone);
+        if (status) {
+            goto invalid;
+        }
+
+        switch (nvme_zs(zone)) {
+        case NVME_ZS_ZSE:
+        case NVME_ZS_ZSC:
+            nvme_zs_set(zone, NVME_ZS_ZSIO);
+        default:
+            break;
+        }
+
+        cb = nvme_aio_zone_write_cb;
+        cb_arg = zone;
+
+        zone->wp_staging += req->nlb;
+    }
 
     aio = g_new0(NvmeAIO, 1);
 
@@ -1173,25 +1404,33 @@ static uint16_t nvme_write_zeroes(NvmeCtrl *n, NvmeRequest *req)
         .offset = offset,
         .len = count,
         .req = req,
-        .cb = nvme_aio_write_cb,
+        .cb = cb,
+        .cb_arg = cb_arg,
     };
 
     nvme_req_add_aio(req, aio);
 
+    nvme_req_set_cb(req, nvme_rw_cb, NULL);
+
     return NVME_NO_COMPLETE;
+
+invalid:
+    block_acct_invalid(blk_get_stats(ns->blk), BLOCK_ACCT_WRITE);
+    return status;
 }
 
-static uint16_t nvme_rw(NvmeCtrl *n, NvmeRequest *req)
+static uint16_t nvme_do_rw(NvmeCtrl *n, NvmeRequest *req)
 {
-    NvmeRwCmd *rw = (NvmeRwCmd *)&req->cmd;
+    NvmeAIOCompletionFunc *cb = NULL;
+    void *cb_arg = NULL;
+
     NvmeNamespace *ns = req->ns;
 
-    uint32_t len;
-    int status;
+    size_t len;
+    uint16_t status;
 
     enum BlockAcctType acct = BLOCK_ACCT_READ;
     NvmeAIOOp opc = NVME_AIO_OPC_READ;
-    NvmeAIOCompletionFunc *cb = NULL;
 
     if (nvme_req_is_write(req)) {
         acct = BLOCK_ACCT_WRITE;
@@ -1199,8 +1438,6 @@ static uint16_t nvme_rw(NvmeCtrl *n, NvmeRequest *req)
         cb = nvme_aio_write_cb;
     }
 
-    req->nlb  = le16_to_cpu(rw->nlb) + 1;
-    req->slba = le64_to_cpu(rw->slba);
     len = req->nlb << nvme_ns_lbads(ns);
 
     trace_pci_nvme_rw(nvme_cid(req), nvme_req_is_write(req) ? "write" : "read",
@@ -1216,7 +1453,38 @@ static uint16_t nvme_rw(NvmeCtrl *n, NvmeRequest *req)
         goto invalid;
     }
 
-    nvme_aio_rw(ns, opc, cb, req);
+    if (nvme_ns_zoned(ns)) {
+        NvmeZone *zone = nvme_ns_get_zone(ns, req->slba);
+        if (!zone) {
+            trace_pci_nvme_err_invalid_zone(nvme_cid(req), req->slba);
+            status = NVME_INVALID_FIELD | NVME_DNR;
+            goto invalid;
+        }
+
+        status = nvme_check_rwz_zone(n, req->slba, req->nlb, req, zone);
+        if (status) {
+            goto invalid;
+        }
+
+        if (nvme_req_is_write(req)) {
+            switch (nvme_zs(zone)) {
+            case NVME_ZS_ZSE:
+            case NVME_ZS_ZSC:
+                nvme_zs_set(zone, NVME_ZS_ZSIO);
+            default:
+                break;
+            }
+
+            cb = nvme_aio_zone_write_cb;
+            cb_arg = zone;
+
+            zone->wp_staging += req->nlb;
+        }
+    } else if (nvme_req_is_write(req)) {
+        cb = nvme_aio_write_cb;
+    }
+
+    nvme_aio_rw(ns, opc, cb, cb_arg, req);
     nvme_req_set_cb(req, nvme_rw_cb, NULL);
 
     return NVME_NO_COMPLETE;
@@ -1224,6 +1492,47 @@ static uint16_t nvme_rw(NvmeCtrl *n, NvmeRequest *req)
 invalid:
     block_acct_invalid(blk_get_stats(ns->blk), acct);
     return status;
+}
+
+static uint16_t nvme_rwz(NvmeCtrl *n, NvmeRequest *req)
+{
+    NvmeRwCmd *rw = (NvmeRwCmd *) &req->cmd;
+    NvmeNamespace *ns = req->ns;
+    NvmeZone *zone;
+
+    req->nlb  = le16_to_cpu(rw->nlb) + 1;
+    req->slba = le64_to_cpu(rw->slba);
+
+    if (nvme_ns_zoned(ns) && nvme_req_is_write(req)) {
+        zone = nvme_ns_get_zone(ns, req->slba);
+        if (!zone) {
+            trace_pci_nvme_err_invalid_zone(nvme_cid(req), req->slba);
+            return NVME_INVALID_FIELD | NVME_DNR;
+        }
+
+        if (zone->wp_staging != nvme_wp(zone)) {
+            NVME_GUEST_ERR(pci_nvme_zone_pending_writes,
+                           "cid %"PRIu16"; zone (zslba 0x%"PRIx64") has "
+                           "pending writes "
+                           "(wp 0x%"PRIx64" wp_staging 0x%"PRIx64"; "
+                           "additional writes should not be submitted",
+                           nvme_cid(req), nvme_zslba(zone), nvme_wp(zone),
+                           zone->wp_staging);
+
+            if (n->params.defensive) {
+                return NVME_ZONE_INVALID_WRITE;
+            }
+        }
+    }
+
+    switch (req->cmd.opcode) {
+    case NVME_CMD_WRITE_ZEROES:
+        return nvme_do_write_zeroes(n, req);
+    default:
+        break;
+    }
+
+    return nvme_do_rw(n, req);
 }
 
 static uint16_t nvme_io_cmd(NvmeCtrl *n, NvmeRequest *req)
@@ -1245,11 +1554,10 @@ static uint16_t nvme_io_cmd(NvmeCtrl *n, NvmeRequest *req)
     switch (req->cmd.opcode) {
     case NVME_CMD_FLUSH:
         return nvme_flush(n, req);
-    case NVME_CMD_WRITE_ZEROES:
-        return nvme_write_zeroes(n, req);
-    case NVME_CMD_WRITE:
     case NVME_CMD_READ:
-        return nvme_rw(n, req);
+    case NVME_CMD_WRITE:
+    case NVME_CMD_WRITE_ZEROES:
+        return nvme_rwz(n, req);
     default:
         trace_pci_nvme_err_invalid_opc(req->cmd.opcode);
         return NVME_INVALID_OPCODE | NVME_DNR;
@@ -2342,6 +2650,10 @@ static void nvme_clear_ctrl(NvmeCtrl *n)
         if (ns->blk_state) {
             blk_drain(ns->blk_state);
         }
+
+        if (nvme_ns_zoned(ns)) {
+            blk_drain(ns->zns.info.blk);
+        }
     }
 
     for (i = 0; i < n->params.max_ioqpairs + 1; i++) {
@@ -2375,6 +2687,10 @@ static void nvme_clear_ctrl(NvmeCtrl *n)
 
         if (ns->blk_state) {
             blk_flush(ns->blk_state);
+        }
+
+        if (nvme_ns_zoned(ns)) {
+            blk_flush(ns->zns.info.blk);
         }
     }
 
@@ -2897,7 +3213,7 @@ static void nvme_init_state(NvmeCtrl *n)
     n->features.temp_thresh_hi = NVME_TEMPERATURE_WARNING;
     n->starttime_ms = qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL);
     n->aer_reqs = g_new0(NvmeRequest *, n->params.aerl + 1);
-    n->iocscs[0] = 1 << NVME_IOCS_NVM;
+    n->iocscs[0] = (1 << NVME_IOCS_NVM) | (1 << NVME_IOCS_ZONED);
     n->features.iocsci = 0;
 }
 
@@ -3047,6 +3363,9 @@ static void nvme_init_ctrl(NvmeCtrl *n, PCIDevice *pci_dev)
     NvmeIdCtrl *id = &n->id_ctrl;
     uint8_t *pci_conf = pci_dev->config;
 
+    n->id_ctrl_iocss[NVME_IOCS_NVM] = g_new0(NvmeIdCtrl, 1);
+    n->id_ctrl_iocss[NVME_IOCS_ZONED] = g_new0(NvmeIdCtrl, 1);
+
     id->vid = cpu_to_le16(pci_get_word(pci_conf + PCI_VENDOR_ID));
     id->ssvid = cpu_to_le16(pci_get_word(pci_conf + PCI_SUBSYSTEM_VENDOR_ID));
     strpadcpy((char *)id->mn, sizeof(id->mn), "QEMU NVMe Ctrl", ' ');
@@ -3183,6 +3502,7 @@ static Property nvme_props[] = {
     DEFINE_PROP_UINT8("aerl", NvmeCtrl, params.aerl, 3),
     DEFINE_PROP_UINT32("aer_max_queued", NvmeCtrl, params.aer_max_queued, 64),
     DEFINE_PROP_UINT8("mdts", NvmeCtrl, params.mdts, 7),
+    DEFINE_PROP_BOOL("defensive", NvmeCtrl, params.defensive, false),
     DEFINE_PROP_BOOL("x-use-intel-id", NvmeCtrl, params.use_intel_id, false),
     DEFINE_PROP_END_OF_LIST(),
 };

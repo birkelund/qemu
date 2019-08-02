@@ -7,6 +7,7 @@
 #define NVME_MAX_NAMESPACES 256
 
 typedef struct NvmeParams {
+    bool     defensive;
     char     *serial;
     uint32_t num_queues; /* deprecated since 5.1 */
     uint32_t max_ioqpairs;
