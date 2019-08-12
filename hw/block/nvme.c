@@ -1294,6 +1294,12 @@ static void nvme_aio_zone_reset_cb(NvmeAIO *aio, void *opaque, int ret)
     }
 }
 
+static void nvme_zone_append_cb(NvmeRequest *req, void *opaque)
+{
+    trace_pci_nvme_zone_append_cb(nvme_cid(req), le64_to_cpu(req->cqe.qw0));
+    nvme_rw_cb(req, opaque);
+}
+
 static void nvme_aio_cb(void *opaque, int ret)
 {
     NvmeAIO *aio = opaque;
@@ -1422,6 +1428,104 @@ static uint16_t nvme_flush(NvmeCtrl *n, NvmeRequest *req)
     nvme_req_add_aio(req, aio);
 
     return NVME_NO_COMPLETE;
+}
+
+static uint16_t nvme_do_zone_append(NvmeCtrl *n, NvmeRequest *req,
+    NvmeZone *zone)
+{
+    NvmeAIO *aio;
+    NvmeNamespace *ns = req->ns;
+
+    uint64_t zslba = nvme_zslba(zone);
+    uint64_t wp = zone->wp_staging;
+
+    size_t len;
+    uint16_t status;
+
+    req->cqe.qw0 = cpu_to_le64(wp);
+    req->slba = wp;
+
+    len = req->nlb << nvme_ns_lbads(ns);
+
+    trace_pci_nvme_zone_append(nvme_cid(req), zslba, wp, req->nlb);
+
+    status = nvme_check_rw(n, req);
+    if (status) {
+        goto invalid;
+    }
+
+    status = nvme_check_zone_write(n, req->slba, req->nlb, req, zone);
+    if (status) {
+        goto invalid;
+    }
+
+    switch (nvme_zs(zone)) {
+    case NVME_ZS_ZSE:
+    case NVME_ZS_ZSC:
+        nvme_zs_set(zone, NVME_ZS_ZSIO);
+    default:
+        break;
+    }
+
+    status = nvme_map(n, len, req);
+    if (status) {
+        goto invalid;
+    }
+
+    aio = g_new0(NvmeAIO, 1);
+    *aio = (NvmeAIO) {
+        .opc = NVME_AIO_OPC_WRITE,
+        .blk = ns->blk,
+        .offset = req->slba << nvme_ns_lbads(ns),
+        .req = req,
+        .cb = nvme_aio_zone_write_cb,
+        .cb_arg = zone,
+    };
+
+    if (req->qsg.sg) {
+        aio->len = req->qsg.size;
+        aio->flags |= NVME_AIO_DMA;
+    } else {
+        aio->len = req->iov.size;
+    }
+
+    nvme_req_add_aio(req, aio);
+    nvme_req_set_cb(req, nvme_zone_append_cb, zone);
+
+    zone->wp_staging += req->nlb;
+
+    return NVME_NO_COMPLETE;
+
+invalid:
+    block_acct_invalid(blk_get_stats(ns->blk), BLOCK_ACCT_WRITE);
+    return status;
+}
+
+static uint16_t nvme_zone_append(NvmeCtrl *n, NvmeRequest *req)
+{
+    NvmeZone *zone;
+    NvmeZoneAppendCmd *zappend = (NvmeZoneAppendCmd *) &req->cmd;
+    NvmeNamespace *ns = req->ns;
+    uint64_t zslba = le64_to_cpu(zappend->zslba);
+
+    if (!nvme_ns_zoned(ns)) {
+        return NVME_INVALID_OPCODE | NVME_DNR;
+    }
+
+    if (zslba & (nvme_ns_zsze(ns) - 1)) {
+        trace_pci_nvme_err_invalid_zslba(nvme_cid(req), zslba);
+        return NVME_INVALID_FIELD | NVME_DNR;
+    }
+
+    req->nlb = le16_to_cpu(zappend->nlb) + 1;
+
+    zone = nvme_ns_get_zone(ns, zslba);
+    if (!zone) {
+        trace_pci_nvme_err_invalid_zone(nvme_cid(req), req->slba);
+        return NVME_INVALID_FIELD | NVME_DNR;
+    }
+
+    return nvme_do_zone_append(n, req, zone);
 }
 
 static uint16_t nvme_zone_mgmt_send_close(NvmeCtrl *n, NvmeRequest *req,
@@ -2142,6 +2246,8 @@ static uint16_t nvme_io_cmd(NvmeCtrl *n, NvmeRequest *req)
         return nvme_zone_mgmt_send(n, req);
     case NVME_CMD_ZONE_MGMT_RECV:
         return nvme_zone_mgmt_recv(n, req);
+    case NVME_CMD_ZONE_APPEND:
+        return nvme_zone_append(n, req);
     default:
         trace_pci_nvme_err_invalid_opc(req->cmd.opcode);
         return NVME_INVALID_OPCODE | NVME_DNR;
