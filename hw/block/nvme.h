@@ -53,6 +53,8 @@ static const NvmeEffectsLog nvme_effects[] = {
             [NVME_CMD_ZONE_MGMT_RECV]   = NVME_EFFECTS_CSUPP,
             [NVME_CMD_ZONE_MGMT_SEND]   = NVME_EFFECTS_CSUPP |
                 NVME_EFFECTS_LBCC,
+            [NVME_CMD_ZONE_APPEND]      = NVME_EFFECTS_CSUPP |
+                NVME_EFFECTS_LBCC,
         }
     },
 };
@@ -177,6 +179,7 @@ static inline bool nvme_req_is_write(NvmeRequest *req)
     switch (req->cmd.opcode) {
     case NVME_CMD_WRITE:
     case NVME_CMD_WRITE_ZEROES:
+    case NVME_CMD_ZONE_APPEND:
         return true;
     default:
         return false;
