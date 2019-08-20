@@ -59,8 +59,16 @@ static int nvme_ns_blk_resize(BlockBackend *blk, size_t len, Error **errp)
 
 static void nvme_ns_init(NvmeNamespace *ns)
 {
-    NvmeIdNs *id_ns = &ns->id_ns;
+    NvmeIdNsNvm *id_ns;
 
+    int unmap = blk_get_flags(ns->blk) & BDRV_O_UNMAP;
+
+    ns->id_ns[NVME_IOCS_NVM] = g_new0(NvmeIdNsNvm, 1);
+    id_ns = nvme_ns_id_nvm(ns);
+
+    ns->iocs = ns->params.iocs;
+
+    id_ns->dlfeat = unmap ? 0x9 : 0x0;
     id_ns->lbaf[0].ds = ns->params.lbads;
 
     id_ns->nsze = cpu_to_le64(nvme_ns_nlbas(ns));
@@ -130,8 +138,7 @@ static int nvme_ns_init_blk_state(NvmeNamespace *ns, Error **errp)
     return 0;
 }
 
-static int nvme_ns_init_blk(NvmeCtrl *n, NvmeNamespace *ns, NvmeIdCtrl *id,
-                            Error **errp)
+static int nvme_ns_init_blk(NvmeCtrl *n, NvmeNamespace *ns, Error **errp)
 {
     uint64_t perm, shared_perm;
 
@@ -174,7 +181,8 @@ static int nvme_ns_init_blk(NvmeCtrl *n, NvmeNamespace *ns, NvmeIdCtrl *id,
     return 0;
 }
 
-static int nvme_ns_check_constraints(NvmeNamespace *ns, Error **errp)
+static int nvme_ns_check_constraints(NvmeCtrl *n, NvmeNamespace *ns, Error
+                                     **errp)
 {
     if (!ns->blk) {
         error_setg(errp, "block backend not configured");
@@ -191,11 +199,11 @@ static int nvme_ns_check_constraints(NvmeNamespace *ns, Error **errp)
 
 int nvme_ns_setup(NvmeCtrl *n, NvmeNamespace *ns, Error **errp)
 {
-    if (nvme_ns_check_constraints(ns, errp)) {
+    if (nvme_ns_check_constraints(n, ns, errp)) {
         return -1;
     }
 
-    if (nvme_ns_init_blk(n, ns, &n->id_ctrl, errp)) {
+    if (nvme_ns_init_blk(n, ns, errp)) {
         return -1;
     }
 
@@ -210,7 +218,8 @@ int nvme_ns_setup(NvmeCtrl *n, NvmeNamespace *ns, Error **errp)
          * With a state file in place we can enable the Deallocated or
          * Unwritten Logical Block Error feature.
          */
-        ns->id_ns.nsfeat |= 0x4;
+        NvmeIdNsNvm *id_ns = nvme_ns_id_nvm(ns);
+        id_ns->nsfeat |= 0x4;
     }
 
     if (nvme_register_namespace(n, ns, errp)) {
@@ -239,6 +248,7 @@ static Property nvme_ns_props[] = {
     DEFINE_PROP_UINT32("nsid", NvmeNamespace, params.nsid, 0),
     DEFINE_PROP_UINT8("lbads", NvmeNamespace, params.lbads, BDRV_SECTOR_BITS),
     DEFINE_PROP_DRIVE("state", NvmeNamespace, blk_state),
+    DEFINE_PROP_UINT8("iocs", NvmeNamespace, params.iocs, 0x0),
     DEFINE_PROP_END_OF_LIST(),
 };
 

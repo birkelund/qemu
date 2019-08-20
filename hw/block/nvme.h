@@ -18,28 +18,33 @@ typedef struct NvmeParams {
     bool     use_intel_id;
 } NvmeParams;
 
-static const NvmeEffectsLog nvme_effects = {
-    .acs = {
-        [NVME_ADM_CMD_DELETE_SQ]    = NVME_EFFECTS_CSUPP,
-        [NVME_ADM_CMD_CREATE_SQ]    = NVME_EFFECTS_CSUPP,
-        [NVME_ADM_CMD_GET_LOG_PAGE] = NVME_EFFECTS_CSUPP,
-        [NVME_ADM_CMD_DELETE_CQ]    = NVME_EFFECTS_CSUPP,
-        [NVME_ADM_CMD_CREATE_CQ]    = NVME_EFFECTS_CSUPP,
-        [NVME_ADM_CMD_IDENTIFY]     = NVME_EFFECTS_CSUPP,
-        [NVME_ADM_CMD_ABORT]        = NVME_EFFECTS_CSUPP,
-        [NVME_ADM_CMD_SET_FEATURES] = NVME_EFFECTS_CSUPP | NVME_EFFECTS_CCC |
-            NVME_EFFECTS_NIC | NVME_EFFECTS_NCC,
-        [NVME_ADM_CMD_GET_FEATURES] = NVME_EFFECTS_CSUPP,
-        [NVME_ADM_CMD_FORMAT_NVM]   = NVME_EFFECTS_CSUPP | NVME_EFFECTS_LBCC |
-            NVME_EFFECTS_NCC | NVME_EFFECTS_NIC | NVME_EFFECTS_CSE_MULTI,
-        [NVME_ADM_CMD_ASYNC_EV_REQ] = NVME_EFFECTS_CSUPP,
-    },
+static const NvmeEffectsLog nvme_effects[] = {
+    [NVME_IOCS_NVM] = {
+        .acs = {
+            [NVME_ADM_CMD_DELETE_SQ]    = NVME_EFFECTS_CSUPP,
+            [NVME_ADM_CMD_CREATE_SQ]    = NVME_EFFECTS_CSUPP,
+            [NVME_ADM_CMD_GET_LOG_PAGE] = NVME_EFFECTS_CSUPP,
+            [NVME_ADM_CMD_DELETE_CQ]    = NVME_EFFECTS_CSUPP,
+            [NVME_ADM_CMD_CREATE_CQ]    = NVME_EFFECTS_CSUPP,
+            [NVME_ADM_CMD_IDENTIFY]     = NVME_EFFECTS_CSUPP,
+            [NVME_ADM_CMD_ABORT]        = NVME_EFFECTS_CSUPP,
+            [NVME_ADM_CMD_SET_FEATURES] = NVME_EFFECTS_CSUPP |
+                NVME_EFFECTS_CCC | NVME_EFFECTS_NIC | NVME_EFFECTS_NCC,
+            [NVME_ADM_CMD_GET_FEATURES] = NVME_EFFECTS_CSUPP,
+            [NVME_ADM_CMD_FORMAT_NVM]   = NVME_EFFECTS_CSUPP |
+                NVME_EFFECTS_LBCC | NVME_EFFECTS_NCC | NVME_EFFECTS_NIC |
+                NVME_EFFECTS_CSE_MULTI,
+            [NVME_ADM_CMD_ASYNC_EV_REQ] = NVME_EFFECTS_CSUPP,
+        },
 
-    .iocs = {
-        [NVME_CMD_FLUSH]            = NVME_EFFECTS_CSUPP,
-        [NVME_CMD_WRITE]            = NVME_EFFECTS_CSUPP | NVME_EFFECTS_LBCC,
-        [NVME_CMD_READ]             = NVME_EFFECTS_CSUPP,
-        [NVME_CMD_WRITE_ZEROES]     = NVME_EFFECTS_CSUPP | NVME_EFFECTS_LBCC,
+        .iocs = {
+            [NVME_CMD_FLUSH]            = NVME_EFFECTS_CSUPP,
+            [NVME_CMD_WRITE]            = NVME_EFFECTS_CSUPP |
+                NVME_EFFECTS_LBCC,
+            [NVME_CMD_READ]             = NVME_EFFECTS_CSUPP,
+            [NVME_CMD_WRITE_ZEROES]     = NVME_EFFECTS_CSUPP |
+                NVME_EFFECTS_LBCC,
+        },
     },
 };
 
@@ -193,6 +198,7 @@ typedef struct NvmeFeatureVal {
     };
     uint32_t    async_config;
     uint32_t    vwc;
+    uint32_t    iocsci;
 } NvmeFeatureVal;
 
 static const uint32_t nvme_feature_cap[0x100] = {
@@ -202,6 +208,7 @@ static const uint32_t nvme_feature_cap[0x100] = {
     [NVME_NUMBER_OF_QUEUES]         = NVME_FEAT_CAP_CHANGE,
     [NVME_ASYNCHRONOUS_EVENT_CONF]  = NVME_FEAT_CAP_CHANGE,
     [NVME_TIMESTAMP]                = NVME_FEAT_CAP_CHANGE,
+    [NVME_COMMAND_SET_PROFILE]      = NVME_FEAT_CAP_CHANGE,
 };
 
 static const uint32_t nvme_feature_default[0x100] = {
@@ -220,6 +227,7 @@ static const bool nvme_feature_support[0x100] = {
     [NVME_WRITE_ATOMICITY]          = true,
     [NVME_ASYNCHRONOUS_EVENT_CONF]  = true,
     [NVME_TIMESTAMP]                = true,
+    [NVME_COMMAND_SET_PROFILE]      = true,
 };
 
 typedef struct NvmeCtrl {
@@ -247,6 +255,7 @@ typedef struct NvmeCtrl {
     uint64_t    timestamp_set_qemu_clock_ms;    /* QEMU clock time */
     uint64_t    starttime_ms;
     uint16_t    temperature;
+    uint64_t    iocscs[512];
 
     HostMemoryBackend *pmrdev;
 
@@ -262,6 +271,7 @@ typedef struct NvmeCtrl {
     NvmeSQueue      admin_sq;
     NvmeCQueue      admin_cq;
     NvmeIdCtrl      id_ctrl;
+    void            *id_ctrl_iocss[256];
     NvmeFeatureVal  features;
 } NvmeCtrl;
 

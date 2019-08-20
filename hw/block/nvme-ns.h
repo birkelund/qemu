@@ -21,6 +21,7 @@
 
 typedef struct NvmeNamespaceParams {
     uint32_t nsid;
+    uint8_t  iocs;
     uint8_t  lbads;
 } NvmeNamespaceParams;
 
@@ -30,8 +31,9 @@ typedef struct NvmeNamespace {
     BlockBackend *blk_state;
     int32_t      bootindex;
     int64_t      size;
+    uint8_t      iocs;
 
-    NvmeIdNs            id_ns;
+    void         *id_ns[256];
     NvmeNamespaceParams params;
 
     unsigned long *utilization;
@@ -50,9 +52,14 @@ static inline uint32_t nvme_nsid(NvmeNamespace *ns)
     return -1;
 }
 
+static inline NvmeIdNsNvm *nvme_ns_id_nvm(NvmeNamespace *ns)
+{
+    return ns->id_ns[NVME_IOCS_NVM];
+}
+
 static inline NvmeLBAF *nvme_ns_lbaf(NvmeNamespace *ns)
 {
-    NvmeIdNs *id_ns = &ns->id_ns;
+    NvmeIdNsNvm *id_ns = nvme_ns_id_nvm(ns);
     return &id_ns->lbaf[NVME_ID_NS_FLBAS_INDEX(id_ns->flbas)];
 }
 

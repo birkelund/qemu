@@ -93,6 +93,11 @@ enum NvmeCapMask {
 #define NVME_CAP_SET_CMBS(cap, val)   (cap |= (uint64_t)(val & CAP_CMBS_MASK)\
                                                             << CAP_CMBS_SHIFT)
 
+enum NvmeCapCss {
+    NVME_CAP_CSS_NVM = 1 << 0,
+    NVME_CAP_CSS_CSI = 1 << 6,
+};
+
 enum NvmeCcShift {
     CC_EN_SHIFT     = 0,
     CC_CSS_SHIFT    = 4,
@@ -120,6 +125,11 @@ enum NvmeCcMask {
 #define NVME_CC_SHN(cc)    ((cc >> CC_SHN_SHIFT)    & CC_SHN_MASK)
 #define NVME_CC_IOSQES(cc) ((cc >> CC_IOSQES_SHIFT) & CC_IOSQES_MASK)
 #define NVME_CC_IOCQES(cc) ((cc >> CC_IOCQES_SHIFT) & CC_IOCQES_MASK)
+
+enum NvmeCcCss {
+    NVME_CC_CSS_NVM = 0x0,
+    NVME_CC_CSS_ALL = 0x6,
+};
 
 enum NvmeCstsShift {
     CSTS_RDY_SHIFT      = 0,
@@ -454,6 +464,10 @@ enum NvmeCmbmscMask {
 
 #define NVME_CMBSTS_CBAI(cmbsts) (cmsts & 0x1)
 
+enum NvmeCommandSet {
+    NVME_IOCS_NVM = 0x0,
+};
+
 enum NvmeSglDescriptorType {
     NVME_SGL_DESCR_TYPE_DATA_BLOCK          = 0x0,
     NVME_SGL_DESCR_TYPE_BIT_BUCKET          = 0x1,
@@ -604,7 +618,8 @@ typedef struct NvmeIdentify {
     uint8_t     rsvd3;
     uint16_t    cntid;
     uint16_t    nvmsetid;
-    uint16_t    rsvd4;
+    uint8_t     rsvd4;
+    uint8_t     csi;
     uint32_t    rsvd11[4];
 } NvmeIdentify;
 
@@ -697,8 +712,15 @@ typedef struct NvmeAerResult {
 } NvmeAerResult;
 
 typedef struct NvmeCqe {
-    uint32_t    result;
-    uint32_t    rsvd;
+    union {
+        struct {
+            uint32_t    dw0;
+            uint32_t    dw1;
+        };
+
+        uint64_t qw0;
+    };
+
     uint16_t    sq_head;
     uint16_t    sq_id;
     uint16_t    cid;
@@ -746,6 +768,10 @@ enum NvmeStatusCodes {
     NVME_FEAT_NOT_CHANGABLE     = 0x010e,
     NVME_FEAT_NOT_NS_SPEC       = 0x010f,
     NVME_FW_REQ_SUSYSTEM_RESET  = 0x0110,
+    NVME_IOCS_NOT_SUPPORTED     = 0x0127,
+    NVME_IOCS_NOT_ENABLED       = 0x0128,
+    NVME_IOCS_COMB_REJECTED     = 0x0129,
+    NVME_INVALID_IOCS           = 0x0126,
     NVME_CONFLICTING_ATTRS      = 0x0180,
     NVME_INVALID_PROT_INFO      = 0x0181,
     NVME_WRITE_TO_RO            = 0x0182,
@@ -890,10 +916,14 @@ typedef struct NvmePSD {
 #define NVME_IDENTIFY_DATA_SIZE 4096
 
 enum {
-    NVME_ID_CNS_NS             = 0x0,
-    NVME_ID_CNS_CTRL           = 0x1,
-    NVME_ID_CNS_NS_ACTIVE_LIST = 0x2,
-    NVME_ID_CNS_NS_DESCR_LIST  = 0x3,
+    NVME_ID_CNS_NS                     = 0x00,
+    NVME_ID_CNS_CTRL                   = 0x01,
+    NVME_ID_CNS_NS_ACTIVE_LIST         = 0x02,
+    NVME_ID_CNS_NS_DESCR_LIST          = 0x03,
+    NVME_ID_CNS_NS_IOCS                = 0x05,
+    NVME_ID_CNS_CTRL_IOCS              = 0x06,
+    NVME_ID_CNS_NS_ACTIVE_LIST_IOCS    = 0x07,
+    NVME_ID_CNS_IOCS                   = 0x1c,
 };
 
 typedef struct NvmeIdCtrl {
@@ -1058,6 +1088,7 @@ enum NvmeFeatureIds {
     NVME_WRITE_ATOMICITY            = 0xa,
     NVME_ASYNCHRONOUS_EVENT_CONF    = 0xb,
     NVME_TIMESTAMP                  = 0xe,
+    NVME_COMMAND_SET_PROFILE        = 0x19,
     NVME_SOFTWARE_PROGRESS_MARKER   = 0x80
 };
 
@@ -1105,7 +1136,7 @@ typedef struct NvmeLBAF {
 
 #define NVME_NSID_BROADCAST 0xffffffff
 
-typedef struct NvmeIdNs {
+typedef struct NvmeIdNsNvm {
     uint64_t    nsze;
     uint64_t    ncap;
     uint64_t    nuse;
@@ -1143,7 +1174,7 @@ typedef struct NvmeIdNs {
     NvmeLBAF    lbaf[16];
     uint8_t     rsvd192[192];
     uint8_t     vs[3712];
-} NvmeIdNs;
+} NvmeIdNsNvm;
 
 typedef struct NvmeIdNsDescr {
     uint8_t nidt;
@@ -1154,11 +1185,13 @@ typedef struct NvmeIdNsDescr {
 #define NVME_NIDT_EUI64_LEN 8
 #define NVME_NIDT_NGUID_LEN 16
 #define NVME_NIDT_UUID_LEN  16
+#define NVME_NIDT_CSI_LEN   1
 
 enum {
     NVME_NIDT_EUI64 = 0x1,
     NVME_NIDT_NGUID = 0x2,
     NVME_NIDT_UUID  = 0x3,
+    NVME_NIDT_CSI   = 0x4,
 };
 
 /*Deallocate Logical Block Features*/
@@ -1211,7 +1244,7 @@ static inline void _nvme_check_size(void)
     QEMU_BUILD_BUG_ON(sizeof(NvmeSmartLog) != 512);
     QEMU_BUILD_BUG_ON(sizeof(NvmeEnduranceGroupLog) != 512);
     QEMU_BUILD_BUG_ON(sizeof(NvmeIdCtrl) != 4096);
-    QEMU_BUILD_BUG_ON(sizeof(NvmeIdNs) != 4096);
+    QEMU_BUILD_BUG_ON(sizeof(NvmeIdNsNvm) != 4096);
     QEMU_BUILD_BUG_ON(sizeof(NvmeNvmSetAttributes) != 128);
     QEMU_BUILD_BUG_ON(sizeof(NvmeIdNvmSetList) != 4096);
     QEMU_BUILD_BUG_ON(sizeof(NvmeBar) != 4096);
