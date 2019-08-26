@@ -262,8 +262,13 @@ static void nvme_ns_init_zoned(NvmeNamespace *ns)
 
     id_ns->ncap = ns->zns.info.num_zones * ns->params.zns.zcap;
 
-    id_ns_zns->mar = 0xffffffff;
-    id_ns_zns->mor = 0xffffffff;
+    id_ns_zns->mar = cpu_to_le32(ns->params.zns.mar);
+    id_ns_zns->mor = cpu_to_le32(ns->params.zns.mor);
+
+    ns->zns.resources.active = ns->params.zns.mar != 0xffffffff ?
+        ns->params.zns.mar + 1 : ns->zns.info.num_zones;
+    ns->zns.resources.open = ns->params.zns.mor != 0xffffffff ?
+        ns->params.zns.mor + 1 : ns->zns.info.num_zones;
 }
 
 static void nvme_ns_init(NvmeNamespace *ns)
@@ -426,6 +431,12 @@ static int nvme_ns_check_constraints(NvmeCtrl *n, NvmeNamespace *ns, Error
             return -1;
         }
 
+        if (ns->params.zns.mor > ns->params.zns.mar) {
+            error_setg(errp, "maximum open resources (MOR) must be less "
+                       "than or equal to maximum active resources (MAR)");
+            return -1;
+        }
+
         break;
 
     default:
@@ -499,6 +510,8 @@ static Property nvme_ns_props[] = {
     DEFINE_PROP_UINT8("zns.zdes", NvmeNamespace, params.zns.zdes, 0),
     DEFINE_PROP_UINT16("zns.zoc", NvmeNamespace, params.zns.zoc, 0),
     DEFINE_PROP_UINT16("zns.ozcs", NvmeNamespace, params.zns.ozcs, 0),
+    DEFINE_PROP_UINT32("zns.mar", NvmeNamespace, params.zns.mar, 0xffffffff),
+    DEFINE_PROP_UINT32("zns.mor", NvmeNamespace, params.zns.mor, 0xffffffff),
     DEFINE_PROP_END_OF_LIST(),
 };
 
