@@ -778,6 +778,7 @@ typedef struct NvmeDsmRange {
 enum NvmeAsyncEventRequest {
     NVME_AER_TYPE_ERROR                     = 0,
     NVME_AER_TYPE_SMART                     = 1,
+    NVME_AER_TYPE_NOTICE                    = 2,
     NVME_AER_TYPE_IO_SPECIFIC               = 6,
     NVME_AER_TYPE_VENDOR_SPECIFIC           = 7,
     NVME_AER_INFO_ERR_INVALID_DB_REGISTER   = 0,
@@ -992,6 +993,14 @@ typedef struct NvmeZoneDescriptor {
 
 #define NVME_ZS(zs) (((zs) >> 4) & 0xf)
 #define NVME_ZS_SET(zs, state) ((zs) = ((state) << 4))
+
+#define NVME_CHANGED_ZONE_LIST_MAX_IDS 511
+
+typedef struct NvmeChangedZoneList {
+    uint16_t num_ids;
+    uint8_t  rsvd2[6];
+    uint64_t ids[NVME_CHANGED_ZONE_LIST_MAX_IDS];
+} NvmeChangedZoneList;
 
 #define NVME_ZA_ZFC(za)  ((za) & (1 << 0))
 #define NVME_ZA_FZR(za)  ((za) & (1 << 1))
@@ -1428,5 +1437,6 @@ static inline void _nvme_check_size(void)
     QEMU_BUILD_BUG_ON(sizeof(NvmeEffectsLog) != 4096);
     QEMU_BUILD_BUG_ON(sizeof(NvmeZoneDescriptor) != 64);
     QEMU_BUILD_BUG_ON(sizeof(NvmeLBAFE) != 16);
+    QEMU_BUILD_BUG_ON(sizeof(NvmeChangedZoneList) != 4096);
 }
 #endif
