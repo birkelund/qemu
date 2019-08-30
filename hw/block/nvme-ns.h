@@ -75,6 +75,8 @@ typedef struct NvmeNamespace {
             QTAILQ_HEAD(, NvmeZone) lru_open;
             QTAILQ_HEAD(, NvmeZone) lru_active;
         } resources;
+
+        NvmeChangedZoneList changed_list;
     } zns;
 } NvmeNamespace;
 
