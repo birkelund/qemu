@@ -1187,6 +1187,41 @@ static void nvme_update_zone_descr(NvmeNamespace *ns, NvmeRequest *req,
     nvme_req_add_aio(req, aio);
 }
 
+static uint16_t nvme_zrm_transition(NvmeCtrl *n, NvmeNamespace *ns,
+                                    NvmeZone *zone, NvmeZoneState to,
+                                    NvmeRequest *req);
+
+static uint16_t nvme_zrm_release_open(NvmeCtrl *n, NvmeNamespace *ns,
+                                      NvmeRequest *req)
+{
+    NvmeZone *candidate;
+    NvmeZoneState zs;
+
+    trace_pci_nvme_zone_zrm_release_open(nvme_cid(req), ns->params.nsid);
+
+    QTAILQ_FOREACH(candidate, &ns->zns.resources.lru_open, lru_entry) {
+        zs = nvme_zs(candidate);
+
+        trace_pci_nvme_zone_zrm_candidate(nvme_cid(req), ns->params.nsid,
+                                          nvme_zslba(candidate),
+                                          nvme_wp(candidate), zs);
+
+        /* skip explicitly opened zones */
+        if (zs == NVME_ZS_ZSEO) {
+            continue;
+        }
+
+        /* the zone cannot be closed if it is currently writing */
+        if (candidate->wp_staging != nvme_wp(candidate)) {
+            continue;
+        }
+
+        return nvme_zrm_transition(n, ns, candidate, NVME_ZS_ZSC, req);
+    }
+
+    return NVME_TOO_MANY_OPEN_ZONES;
+}
+
 /*
  * nvme_zrm_transition validates zone state transitions under the constraint of
  * the Number of Active and Open Resources (NAR and NOR) limits as reported by
@@ -1195,52 +1230,59 @@ static void nvme_update_zone_descr(NvmeNamespace *ns, NvmeRequest *req,
  * The function does NOT change the Zone Attribute field; this must be done by
  * the caller.
  */
-static uint16_t nvme_zrm_transition(NvmeNamespace *ns, NvmeZone *zone,
-                                    NvmeZoneState to)
+static uint16_t nvme_zrm_transition(NvmeCtrl *n, NvmeNamespace *ns,
+                                    NvmeZone *zone, NvmeZoneState to,
+                                    NvmeRequest *req)
 {
     NvmeZoneState from = nvme_zs(zone);
+    uint16_t status;
 
-    /* fast path */
-    if (from == to) {
-        return NVME_SUCCESS;
-    }
+    trace_pci_nvme_zone_zrm_transition(nvme_cid(req), ns->params.nsid,
+                                       nvme_zslba(zone), nvme_zs(zone), to);
 
     switch (from) {
     case NVME_ZS_ZSE:
         switch (to) {
+        case NVME_ZS_ZSE:
+            return NVME_SUCCESS;
+
         case NVME_ZS_ZSRO:
         case NVME_ZS_ZSO:
         case NVME_ZS_ZSF:
-            nvme_zs_set(zone, to);
-            return NVME_SUCCESS;
+            goto out;
 
         case NVME_ZS_ZSC:
             if (!ns->zns.resources.active) {
+                trace_pci_nvme_err_too_many_active_zones(nvme_cid(req));
                 return NVME_TOO_MANY_ACTIVE_ZONES;
             }
 
             ns->zns.resources.active--;
 
-            nvme_zs_set(zone, to);
+            QTAILQ_INSERT_TAIL(&ns->zns.resources.lru_active, zone, lru_entry);
 
-            return NVME_SUCCESS;
+            goto out;
 
         case NVME_ZS_ZSIO:
         case NVME_ZS_ZSEO:
             if (!ns->zns.resources.active) {
+                trace_pci_nvme_err_too_many_active_zones(nvme_cid(req));
                 return NVME_TOO_MANY_ACTIVE_ZONES;
             }
 
             if (!ns->zns.resources.open) {
-                return NVME_TOO_MANY_OPEN_ZONES;
+                status = nvme_zrm_release_open(n, ns, req);
+                if (status) {
+                    return status;
+                }
             }
 
             ns->zns.resources.active--;
             ns->zns.resources.open--;
 
-            nvme_zs_set(zone, to);
+            QTAILQ_INSERT_TAIL(&ns->zns.resources.lru_open, zone, lru_entry);
 
-            return NVME_SUCCESS;
+            goto out;
 
         default:
             return NVME_INVALID_ZONE_STATE_TRANSITION | NVME_DNR;
@@ -1248,6 +1290,9 @@ static uint16_t nvme_zrm_transition(NvmeNamespace *ns, NvmeZone *zone,
 
     case NVME_ZS_ZSEO:
         switch (to) {
+        case NVME_ZS_ZSEO:
+            return NVME_SUCCESS;
+
         case NVME_ZS_ZSIO:
             return NVME_INVALID_ZONE_STATE_TRANSITION | NVME_DNR;
         default:
@@ -1258,24 +1303,30 @@ static uint16_t nvme_zrm_transition(NvmeNamespace *ns, NvmeZone *zone,
 
     case NVME_ZS_ZSIO:
         switch (to) {
-        case NVME_ZS_ZSEO:
-            nvme_zs_set(zone, to);
+        case NVME_ZS_ZSIO:
             return NVME_SUCCESS;
+
+        case NVME_ZS_ZSEO:
+            goto out;
 
         case NVME_ZS_ZSE:
         case NVME_ZS_ZSF:
         case NVME_ZS_ZSRO:
         case NVME_ZS_ZSO:
             ns->zns.resources.active++;
+            ns->zns.resources.open++;
 
-            /* fallthrough */
+            QTAILQ_REMOVE(&ns->zns.resources.lru_open, zone, lru_entry);
+
+            goto out;
 
         case NVME_ZS_ZSC:
             ns->zns.resources.open++;
 
-            nvme_zs_set(zone, to);
+            QTAILQ_REMOVE(&ns->zns.resources.lru_open, zone, lru_entry);
+            QTAILQ_INSERT_TAIL(&ns->zns.resources.lru_active, zone, lru_entry);
 
-            return NVME_SUCCESS;
+            goto out;
 
         default:
             return NVME_INVALID_ZONE_STATE_TRANSITION | NVME_DNR;
@@ -1283,26 +1334,33 @@ static uint16_t nvme_zrm_transition(NvmeNamespace *ns, NvmeZone *zone,
 
     case NVME_ZS_ZSC:
         switch (to) {
+        case NVME_ZS_ZSC:
+            return NVME_SUCCESS;
+
         case NVME_ZS_ZSE:
         case NVME_ZS_ZSF:
         case NVME_ZS_ZSRO:
         case NVME_ZS_ZSO:
             ns->zns.resources.active++;
-            nvme_zs_set(zone, to);
 
-            return NVME_SUCCESS;
+            QTAILQ_REMOVE(&ns->zns.resources.lru_active, zone, lru_entry);
+
+            goto out;
 
         case NVME_ZS_ZSIO:
         case NVME_ZS_ZSEO:
             if (!ns->zns.resources.open) {
-                return NVME_TOO_MANY_OPEN_ZONES;
+                status = nvme_zrm_release_open(n, ns, req);
+                if (status) {
+                    return status;
+                }
             }
 
             ns->zns.resources.open--;
+            QTAILQ_REMOVE(&ns->zns.resources.lru_active, zone, lru_entry);
+            QTAILQ_INSERT_TAIL(&ns->zns.resources.lru_open, zone, lru_entry);
 
-            nvme_zs_set(zone, to);
-
-            return NVME_SUCCESS;
+            goto out;
 
         default:
             return NVME_INVALID_ZONE_STATE_TRANSITION | NVME_DNR;
@@ -1310,30 +1368,46 @@ static uint16_t nvme_zrm_transition(NvmeNamespace *ns, NvmeZone *zone,
 
     case NVME_ZS_ZSRO:
         switch (to) {
-        case NVME_ZS_ZSO:
-            nvme_zs_set(zone, to);
+        case NVME_ZS_ZSRO:
             return NVME_SUCCESS;
+
+        case NVME_ZS_ZSO:
+            goto out;
+
         default:
             return NVME_INVALID_ZONE_STATE_TRANSITION | NVME_DNR;
         }
 
     case NVME_ZS_ZSF:
         switch (to) {
+        case NVME_ZS_ZSF:
+            return NVME_SUCCESS;
+
         case NVME_ZS_ZSE:
         case NVME_ZS_ZSRO:
         case NVME_ZS_ZSO:
-            nvme_zs_set(zone, to);
-            return NVME_SUCCESS;
+            goto out;
+
         default:
             return NVME_INVALID_ZONE_STATE_TRANSITION | NVME_DNR;
         }
 
     case NVME_ZS_ZSO:
-        return NVME_INVALID_ZONE_STATE_TRANSITION | NVME_DNR;
+        switch (to) {
+        case NVME_ZS_ZSO:
+            return NVME_SUCCESS;
+
+        default:
+            return NVME_INVALID_ZONE_STATE_TRANSITION | NVME_DNR;
+        }
 
     default:
         return NVME_INVALID_ZONE_STATE_TRANSITION | NVME_DNR;
     }
+
+out:
+    nvme_zs_set(zone, to);
+    return NVME_SUCCESS;
 }
 
 static void nvme_aio_write_cb(NvmeAIO *aio, void *opaque, int ret)
@@ -1361,8 +1435,11 @@ static void nvme_zone_advance_wp(NvmeZone *zone, uint32_t nlb,
 
     wp += nlb;
     if (wp == zslba + nvme_zcap(zone)) {
-        /* if we cannot transition to ZFS something is horribly wrong */
-        assert(nvme_zrm_transition(req->ns, zone, NVME_ZS_ZSF) == NVME_SUCCESS);
+        NvmeCtrl *n = nvme_ctrl(req);
+
+        /* if we cannot transition to ZSF something is horribly wrong */
+        assert(nvme_zrm_transition(n, req->ns, zone, NVME_ZS_ZSF, req) ==
+               NVME_SUCCESS);
     }
 
     zd->wp = cpu_to_le64(wp);
@@ -1418,6 +1495,7 @@ static void nvme_zone_mgmt_send_reset_cb(NvmeRequest *req, void *opaque)
 static void nvme_aio_zone_reset_cb(NvmeAIO *aio, void *opaque, int ret)
 {
     NvmeRequest *req = aio->req;
+    NvmeCtrl *n = nvme_ctrl(req);
     NvmeZone *zone = opaque;
     NvmeNamespace *ns = req->ns;
 
@@ -1431,7 +1509,7 @@ static void nvme_aio_zone_reset_cb(NvmeAIO *aio, void *opaque, int ret)
     trace_pci_nvme_aio_zone_reset_cb(nvme_cid(req), ns->params.nsid, zslba);
 
     /* if we cannot transition to ZSE something is horribly wrong */
-    assert(nvme_zrm_transition(ns, zone, NVME_ZS_ZSE) == NVME_SUCCESS);
+    assert(nvme_zrm_transition(n, ns, zone, NVME_ZS_ZSE, req) == NVME_SUCCESS);
     NVME_ZA_CLEAR(zone->zd.za);
 
     zone->zd.wp = zone->zd.zslba;
@@ -1476,6 +1554,7 @@ static void nvme_aio_cb(void *opaque, int ret)
 
         if (req) {
             NvmeNamespace *ns = req->ns;
+            NvmeCtrl *n = nvme_ctrl(req);
             uint16_t status;
 
             switch (aio->opc) {
@@ -1511,7 +1590,7 @@ static void nvme_aio_cb(void *opaque, int ret)
             if (nvme_ns_zoned(ns)) {
                 NvmeZone *zone = nvme_ns_get_zone(ns, req->slba);
 
-                assert(!nvme_zrm_transition(ns, zone, NVME_ZS_ZSO));
+                assert(!nvme_zrm_transition(n, ns, zone, NVME_ZS_ZSO, req));
                 NVME_ZA_CLEAR(zone->zd.za);
 
                 nvme_update_zone_info(ns, req, zone);
@@ -1616,7 +1695,7 @@ static uint16_t nvme_do_zone_append(NvmeCtrl *n, NvmeRequest *req,
     case NVME_ZS_ZSEO:
         break;
     default:
-        status = nvme_zrm_transition(ns, zone, NVME_ZS_ZSIO);
+        status = nvme_zrm_transition(n, ns, zone, NVME_ZS_ZSIO, req);
         if (status) {
             goto invalid;
         }
@@ -1653,7 +1732,7 @@ static uint16_t nvme_do_zone_append(NvmeCtrl *n, NvmeRequest *req,
 
 zrm_revert:
     /* if we cannot revert the transition something is horribly wrong */
-    assert(nvme_zrm_transition(ns, zone, zs_orig) == NVME_SUCCESS);
+    assert(nvme_zrm_transition(n, ns, zone, zs_orig, req) == NVME_SUCCESS);
 
 invalid:
     block_acct_invalid(blk_get_stats(ns->blk), BLOCK_ACCT_WRITE);
@@ -1706,7 +1785,7 @@ static uint16_t nvme_zone_mgmt_send_close(NvmeCtrl *n, NvmeRequest *req,
         return NVME_INVALID_ZONE_STATE_TRANSITION | NVME_DNR;
     }
 
-    status = nvme_zrm_transition(ns, zone, NVME_ZS_ZSC);
+    status = nvme_zrm_transition(n, ns, zone, NVME_ZS_ZSC, req);
     if (status) {
         return status;
     }
@@ -1725,7 +1804,7 @@ static uint16_t nvme_zone_mgmt_send_finish(NvmeCtrl *n, NvmeRequest *req,
     trace_pci_nvme_zone_mgmt_send_finish(nvme_cid(req), nvme_nsid(ns),
                                          nvme_zslba(zone), nvme_zs_str(zone));
 
-    status = nvme_zrm_transition(ns, zone, NVME_ZS_ZSF);
+    status = nvme_zrm_transition(n, ns, zone, NVME_ZS_ZSF, req);
     if (status) {
         return status;
     }
@@ -1743,7 +1822,7 @@ static uint16_t nvme_zone_mgmt_send_open(NvmeCtrl *n, NvmeRequest *req,
     trace_pci_nvme_zone_mgmt_send_open(nvme_cid(req), nvme_nsid(ns),
                                        nvme_zslba(zone), nvme_zs_str(zone));
 
-    status = nvme_zrm_transition(ns, zone, NVME_ZS_ZSEO);
+    status = nvme_zrm_transition(n, ns, zone, NVME_ZS_ZSEO, req);
     if (status) {
         return status;
     }
@@ -1792,7 +1871,7 @@ static uint16_t nvme_zone_mgmt_send_reset(NvmeCtrl *n, NvmeRequest *req,
         return NVME_NO_COMPLETE;
 
     case NVME_ZS_ZSRO:
-        assert(nvme_zrm_transition(ns, zone, NVME_ZS_ZSO) == NVME_SUCCESS);
+        assert(!nvme_zrm_transition(n, ns, zone, NVME_ZS_ZSO, req));
         nvme_update_zone_info(ns, req, zone);
         return NVME_NO_COMPLETE;
 
@@ -1815,7 +1894,7 @@ static uint16_t nvme_zone_mgmt_send_offline(NvmeCtrl *n, NvmeRequest *req,
 
     switch (nvme_zs(zone)) {
     case NVME_ZS_ZSRO:
-        assert(!nvme_zrm_transition(ns, zone, NVME_ZS_ZSO));
+        assert(!nvme_zrm_transition(n, ns, zone, NVME_ZS_ZSO, req));
         nvme_update_zone_info(ns, req, zone);
         return NVME_NO_COMPLETE;
 
@@ -1844,7 +1923,7 @@ static uint16_t nvme_zone_mgmt_send_set_zde(NvmeCtrl *n, NvmeRequest *req,
         return NVME_INVALID_ZONE_STATE_TRANSITION | NVME_DNR;
     }
 
-    status = nvme_zrm_transition(ns, zone, NVME_ZS_ZSC);
+    status = nvme_zrm_transition(n, ns, zone, NVME_ZS_ZSC, req);
     if (status) {
         return status;
     }
@@ -1852,7 +1931,7 @@ static uint16_t nvme_zone_mgmt_send_set_zde(NvmeCtrl *n, NvmeRequest *req,
     status = nvme_dma(n, zone->zde, nvme_ns_zdes_bytes(ns),
                       DMA_DIRECTION_TO_DEVICE, req);
     if (status) {
-        assert(!nvme_zrm_transition(ns, zone, NVME_ZS_ZSE));
+        assert(!nvme_zrm_transition(n, ns, zone, NVME_ZS_ZSE, req));
         return status;
     }
 
@@ -2072,11 +2151,14 @@ static uint16_t nvme_do_write_zeroes(NvmeCtrl *n, NvmeRequest *req)
         }
 
         switch (nvme_zs(zone)) {
-        case NVME_ZS_ZSE:
-        case NVME_ZS_ZSC:
-            nvme_zs_set(zone, NVME_ZS_ZSIO);
-        default:
+        case NVME_ZS_ZSIO:
+        case NVME_ZS_ZSEO:
             break;
+        default:
+            status = nvme_zrm_transition(n, ns, zone, NVME_ZS_ZSIO, req);
+            if (status) {
+                return status;
+            }
         }
 
         cb = nvme_aio_zone_write_cb;
@@ -2161,7 +2243,7 @@ static uint16_t nvme_do_rw(NvmeCtrl *n, NvmeRequest *req)
             case NVME_ZS_ZSEO:
                 break;
             default:
-                status = nvme_zrm_transition(ns, zone, NVME_ZS_ZSIO);
+                status = nvme_zrm_transition(n, ns, zone, NVME_ZS_ZSIO, req);
                 if (status) {
                     return status;
                 }
