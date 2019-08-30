@@ -269,6 +269,9 @@ static void nvme_ns_init_zoned(NvmeNamespace *ns)
         ns->params.zns.mar + 1 : ns->zns.info.num_zones;
     ns->zns.resources.open = ns->params.zns.mor != 0xffffffff ?
         ns->params.zns.mor + 1 : ns->zns.info.num_zones;
+
+    QTAILQ_INIT(&ns->zns.resources.lru_open);
+    QTAILQ_INIT(&ns->zns.resources.lru_active);
 }
 
 static void nvme_ns_init(NvmeNamespace *ns)
