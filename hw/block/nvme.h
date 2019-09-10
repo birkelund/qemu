@@ -318,5 +318,13 @@ static inline NvmeCtrl *nvme_ctrl(NvmeRequest *req)
 }
 
 int nvme_register_namespace(NvmeCtrl *n, NvmeNamespace *ns, Error **errp);
+uint16_t nvme_zrm_transition(NvmeCtrl *n, NvmeNamespace *ns, NvmeZone *zone,
+                             NvmeZoneState to, NvmeRequest *req);
+void nvme_enqueue_event(NvmeCtrl *n, NvmeNamespace *ns, uint8_t event_type,
+                        uint8_t event_info, uint8_t log_page);
+void nvme_zone_excursion(NvmeCtrl *n, NvmeNamespace *ns, NvmeZone *zone,
+                         NvmeRequest *req);
+void nvme_zone_changed(NvmeCtrl *n, NvmeNamespace *ns, NvmeZone *zone,
+                       NvmeRequest *req);
 
 #endif /* HW_NVME_H */
