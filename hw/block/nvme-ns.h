@@ -31,6 +31,10 @@ typedef struct NvmeNamespaceParams {
         uint16_t ozcs;
         uint32_t mar;
         uint32_t mor;
+        uint32_t rrl;
+        uint32_t frl;
+        uint32_t rrld;
+        uint32_t frld;
     } zns;
 } NvmeNamespaceParams;
 
@@ -39,6 +43,11 @@ typedef struct NvmeZone {
     uint8_t             *zde;
 
     uint64_t wp_staging;
+
+    struct {
+        int64_t activated_ns;
+        int64_t finished_ns;
+    } stats;
 
     QTAILQ_ENTRY(NvmeZone) lru_entry;
 } NvmeZone;
@@ -77,6 +86,10 @@ typedef struct NvmeNamespace {
         } resources;
 
         NvmeChangedZoneList changed_list;
+
+        QTAILQ_HEAD(, NvmeZone) lru_finished;
+        QEMUTimer *timer;
+        int64_t rrl_ns, rrld_ns, frl_ns, frld_ns;
     } zns;
 } NvmeNamespace;
 

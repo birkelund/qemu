@@ -875,13 +875,13 @@ static void nvme_process_aers(void *opaque)
     }
 }
 
-static void nvme_enqueue_event(NvmeCtrl *n, NvmeNamespace *ns,
-                               uint8_t event_type, uint8_t event_info,
-                               uint8_t log_page)
+void nvme_enqueue_event(NvmeCtrl *n, NvmeNamespace *ns, uint8_t event_type,
+                        uint8_t event_info, uint8_t log_page)
 {
     NvmeAsyncEvent *event;
 
-    trace_pci_nvme_enqueue_event(event_type, event_info, log_page);
+    trace_pci_nvme_enqueue_event(ns ? ns->params.nsid : -1, event_type,
+                                 event_info, log_page);
 
     if (n->aer_queued == n->params.aer_max_queued) {
         trace_pci_nvme_enqueue_event_noqueue(n->aer_queued);
@@ -1194,7 +1194,7 @@ static void nvme_update_zone_descr(NvmeNamespace *ns, NvmeRequest *req,
     nvme_req_add_aio(req, aio);
 }
 
-static void nvme_zone_changed(NvmeCtrl *n, NvmeNamespace *ns, NvmeZone *zone)
+void nvme_zone_changed(NvmeCtrl *n, NvmeNamespace *ns, NvmeZone *zone)
 {
     uint16_t num_ids = le16_to_cpu(ns->zns.changed_list.num_ids);
 
@@ -1213,12 +1213,8 @@ static void nvme_zone_changed(NvmeCtrl *n, NvmeNamespace *ns, NvmeZone *zone)
                        NVME_LOG_CHANGED_ZONE_LIST);
 }
 
-static uint16_t nvme_zrm_transition(NvmeCtrl *n, NvmeNamespace *ns,
-                                    NvmeZone *zone, NvmeZoneState to,
-                                    NvmeRequest *req);
-
-static void nvme_zone_excursion(NvmeCtrl *n, NvmeNamespace *ns, NvmeZone *zone,
-    NvmeRequest *req)
+void nvme_zone_excursion(NvmeCtrl *n, NvmeNamespace *ns, NvmeZone *zone,
+                         NvmeRequest *req)
 {
     trace_pci_nvme_zone_excursion(ns->params.nsid, nvme_zslba(zone),
                                   nvme_zs_str(zone));
@@ -1226,6 +1222,7 @@ static void nvme_zone_excursion(NvmeCtrl *n, NvmeNamespace *ns, NvmeZone *zone,
     assert(nvme_zrm_transition(n, ns, zone, NVME_ZS_ZSF, req) == NVME_SUCCESS);
 
     NVME_ZA_SET_ZFC(zone->zd.za, 0x1);
+    NVME_ZA_SET_FZR(zone->zd.za, 0x0);
 
     nvme_zone_changed(n, ns, zone);
 
@@ -1333,9 +1330,8 @@ out:
  * The function does NOT change the Zone Attribute field; this must be done by
  * the caller.
  */
-static uint16_t nvme_zrm_transition(NvmeCtrl *n, NvmeNamespace *ns,
-                                    NvmeZone *zone, NvmeZoneState to,
-                                    NvmeRequest *req)
+uint16_t nvme_zrm_transition(NvmeCtrl *n, NvmeNamespace *ns, NvmeZone *zone,
+                             NvmeZoneState to, NvmeRequest *req)
 {
     NvmeZoneState from = nvme_zs(zone);
     uint16_t status;
@@ -1366,7 +1362,7 @@ static uint16_t nvme_zrm_transition(NvmeCtrl *n, NvmeNamespace *ns,
 
             QTAILQ_INSERT_TAIL(&ns->zns.resources.lru_active, zone, lru_entry);
 
-            goto out;
+            goto activated;
 
         case NVME_ZS_ZSIO:
         case NVME_ZS_ZSEO:
@@ -1389,7 +1385,7 @@ static uint16_t nvme_zrm_transition(NvmeCtrl *n, NvmeNamespace *ns,
 
             QTAILQ_INSERT_TAIL(&ns->zns.resources.lru_open, zone, lru_entry);
 
-            goto out;
+            goto activated;
 
         default:
             return NVME_INVALID_ZONE_STATE_TRANSITION | NVME_DNR;
@@ -1512,8 +1508,28 @@ static uint16_t nvme_zrm_transition(NvmeCtrl *n, NvmeNamespace *ns,
         return NVME_INVALID_ZONE_STATE_TRANSITION | NVME_DNR;
     }
 
+activated:
+    zone->stats.activated_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    if (ns->params.zns.frld && !timer_pending(ns->zns.timer)) {
+        int64_t next_timer = zone->stats.activated_ns + ns->zns.frld_ns;
+        timer_mod(ns->zns.timer, next_timer);
+    }
+
 out:
     nvme_zs_set(zone, to);
+
+    if (to == NVME_ZS_ZSF && ns->params.zns.rrld) {
+        QTAILQ_INSERT_TAIL(&ns->zns.lru_finished, zone, lru_entry);
+
+        zone->stats.finished_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+        if (!timer_pending(ns->zns.timer)) {
+            int64_t next_timer = zone->stats.finished_ns + ns->zns.rrld_ns;
+            timer_mod(ns->zns.timer, next_timer);
+        }
+    }
+
     return NVME_SUCCESS;
 }
 
@@ -1979,6 +1995,7 @@ static uint16_t nvme_zone_mgmt_send_reset(NvmeCtrl *n, NvmeRequest *req,
 
     case NVME_ZS_ZSRO:
         assert(!nvme_zrm_transition(n, ns, zone, NVME_ZS_ZSO, req));
+
         nvme_update_zone_info(ns, req, zone);
         return NVME_NO_COMPLETE;
 

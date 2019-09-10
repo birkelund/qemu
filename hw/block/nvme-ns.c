@@ -25,6 +25,7 @@
 #include "hw/qdev-properties.h"
 #include "hw/qdev-core.h"
 
+#include "trace.h"
 #include "nvme.h"
 #include "nvme-ns.h"
 
@@ -46,6 +47,91 @@ const char *nvme_zs_to_str(NvmeZoneState zs)
     }
 
     return NULL;
+}
+
+static void nvme_ns_process_timer(void *opaque)
+{
+    NvmeNamespace *ns = opaque;
+    BusState *s = qdev_get_parent_bus(&ns->parent_obj);
+    NvmeCtrl *n = NVME(s->parent);
+    NvmeZone *zone;
+
+    trace_pci_nvme_ns_process_timer(ns->params.nsid);
+
+    int64_t next_timer = INT64_MAX, now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    QTAILQ_FOREACH(zone, &ns->zns.resources.lru_open, lru_entry) {
+        int64_t activated_ns = now - zone->stats.activated_ns;
+        if (activated_ns < ns->zns.frld_ns) {
+            next_timer = MIN(next_timer, zone->stats.activated_ns +
+                             ns->zns.frld_ns);
+
+            break;
+        }
+
+        if (activated_ns < ns->zns.frld_ns + ns->zns.frl_ns) {
+            NVME_ZA_SET_FZR(zone->zd.za, 0x1);
+            nvme_zone_changed(n, ns, zone);
+
+            next_timer = MIN(next_timer, now + ns->zns.frl_ns);
+
+            continue;
+        }
+
+        if (zone->wp_staging != le64_to_cpu(zone->zd.wp)) {
+            next_timer = now + 500;
+            continue;
+        }
+
+        nvme_zone_excursion(n, ns, zone, NULL);
+    }
+
+    QTAILQ_FOREACH(zone, &ns->zns.resources.lru_active, lru_entry) {
+        int64_t activated_ns = now - zone->stats.activated_ns;
+        if (activated_ns < ns->zns.frld_ns) {
+            next_timer = MIN(next_timer, zone->stats.activated_ns +
+                             ns->zns.frld_ns);
+
+            break;
+        }
+
+        if (activated_ns < ns->zns.frld_ns + ns->zns.frl_ns) {
+            NVME_ZA_SET_FZR(zone->zd.za, 0x1);
+            nvme_zone_changed(n, ns, zone);
+
+            next_timer = MIN(next_timer, now + ns->zns.frl_ns);
+
+            continue;
+        }
+
+        nvme_zone_excursion(n, ns, zone, NULL);
+    }
+
+    QTAILQ_FOREACH(zone, &ns->zns.lru_finished, lru_entry) {
+        int64_t finished_ns = now - zone->stats.finished_ns;
+        if (finished_ns < ns->zns.rrld_ns) {
+            next_timer = MIN(next_timer, zone->stats.finished_ns +
+                             ns->zns.rrld_ns);
+
+            break;
+        }
+
+        if (finished_ns < ns->zns.rrld_ns + ns->zns.rrl_ns) {
+            NVME_ZA_SET_RZR(zone->zd.za, 0x1);
+            nvme_zone_changed(n, ns, zone);
+
+            next_timer = MIN(next_timer, now + ns->zns.rrl_ns);
+
+            nvme_zone_changed(n, ns, zone);
+            continue;
+        }
+
+        NVME_ZA_SET_RZR(zone->zd.za, 0x0);
+    }
+
+    if (next_timer != INT64_MAX) {
+        timer_mod(ns->zns.timer, next_timer);
+    }
 }
 
 static int nvme_ns_blk_resize(BlockBackend *blk, size_t len, Error **errp)
@@ -261,6 +347,21 @@ static void nvme_ns_init_zoned(NvmeNamespace *ns)
     ns->zns.info.zones = g_malloc0_n(ns->zns.info.num_zones, sizeof(NvmeZone));
 
     id_ns->ncap = ns->zns.info.num_zones * ns->params.zns.zcap;
+
+    id_ns_zns->rrl = ns->params.zns.rrl;
+    id_ns_zns->frl = ns->params.zns.frl;
+
+    if (ns->params.zns.rrl || ns->params.zns.frl) {
+        ns->zns.rrl_ns = ns->params.zns.rrl * NANOSECONDS_PER_SECOND;
+        ns->zns.rrld_ns = ns->params.zns.rrld * NANOSECONDS_PER_SECOND;
+        ns->zns.frl_ns = ns->params.zns.frl * NANOSECONDS_PER_SECOND;
+        ns->zns.frld_ns = ns->params.zns.frld * NANOSECONDS_PER_SECOND;
+
+        ns->zns.timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                     nvme_ns_process_timer, ns);
+
+        QTAILQ_INIT(&ns->zns.lru_finished);
+    }
 
     id_ns_zns->mar = cpu_to_le32(ns->params.zns.mar);
     id_ns_zns->mor = cpu_to_le32(ns->params.zns.mor);
@@ -515,6 +616,10 @@ static Property nvme_ns_props[] = {
     DEFINE_PROP_UINT16("zns.ozcs", NvmeNamespace, params.zns.ozcs, 0),
     DEFINE_PROP_UINT32("zns.mar", NvmeNamespace, params.zns.mar, 0xffffffff),
     DEFINE_PROP_UINT32("zns.mor", NvmeNamespace, params.zns.mor, 0xffffffff),
+    DEFINE_PROP_UINT32("zns.rrl", NvmeNamespace, params.zns.rrl, 0),
+    DEFINE_PROP_UINT32("zns.frl", NvmeNamespace, params.zns.frl, 0),
+    DEFINE_PROP_UINT32("zns.rrld", NvmeNamespace, params.zns.rrld, 0),
+    DEFINE_PROP_UINT32("zns.frld", NvmeNamespace, params.zns.frld, 0),
     DEFINE_PROP_END_OF_LIST(),
 };
 
