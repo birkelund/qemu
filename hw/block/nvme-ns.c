@@ -28,6 +28,35 @@
 #include "nvme.h"
 #include "nvme-ns.h"
 
+static int nvme_ns_blk_resize(BlockBackend *blk, size_t len, Error **errp)
+{
+	Error *local_err = NULL;
+	int ret;
+	uint64_t perm, shared_perm;
+
+	blk_get_perm(blk, &perm, &shared_perm);
+
+	ret = blk_set_perm(blk, perm | BLK_PERM_RESIZE, shared_perm, &local_err);
+	if (ret < 0) {
+		error_propagate_prepend(errp, local_err, "blk_set_perm: ");
+		return ret;
+	}
+
+	ret = blk_truncate(blk, len, false, PREALLOC_MODE_OFF, 0, &local_err);
+	if (ret < 0) {
+		error_propagate_prepend(errp, local_err, "blk_truncate: ");
+		return ret;
+	}
+
+	ret = blk_set_perm(blk, perm, shared_perm, &local_err);
+	if (ret < 0) {
+		error_propagate_prepend(errp, local_err, "blk_set_perm: ");
+		return ret;
+	}
+
+	return 0;
+}
+
 static void nvme_ns_init(NvmeNamespace *ns)
 {
     NvmeIdNs *id_ns = &ns->id_ns;
@@ -39,6 +68,66 @@ static void nvme_ns_init(NvmeNamespace *ns)
     /* no thin provisioning */
     id_ns->ncap = id_ns->nsze;
     id_ns->nuse = id_ns->ncap;
+}
+
+static int nvme_ns_init_blk_state(NvmeNamespace *ns, Error **errp)
+{
+    BlockBackend *blk = ns->blk_state;
+    uint64_t perm, shared_perm;
+    int64_t len, state_len;
+
+    Error *local_err = NULL;
+    int ret;
+
+    perm = BLK_PERM_CONSISTENT_READ | BLK_PERM_WRITE;
+    shared_perm = BLK_PERM_ALL;
+
+    ns->utilization = bitmap_new(nvme_ns_nlbas(ns));
+
+    ret = blk_set_perm(blk, perm, shared_perm, &local_err);
+    if (ret) {
+        error_propagate_prepend(errp, local_err, "blk_set_perm: ");
+        return ret;
+    }
+
+    state_len = nvme_ns_blk_state_len(ns);
+
+    len = blk_getlength(blk);
+    if (len < 0) {
+        error_setg_errno(errp, -len, "blk_getlength: ");
+        return len;
+    }
+
+    if (len) {
+        if (len != state_len) {
+            error_setg(errp, "state size mismatch "
+                "(expected %"PRIu64" bytes; was %"PRIu64" bytes)",
+                state_len, len);
+            error_append_hint(errp,
+                "Did you change the 'lbads' parameter? "
+                "Or re-formatted the namespace using Format NVM?\n");
+            return -1;
+        }
+
+        ret = blk_pread(blk, 0, ns->utilization, state_len);
+        if (ret < 0) {
+            error_setg_errno(errp, -ret, "blk_pread: ");
+            return ret;
+        } else if (ret != state_len) {
+            error_setg(errp, "blk_pread: short read");
+            return -1;
+        }
+
+        return 0;
+    }
+
+    ret = nvme_ns_blk_resize(blk, state_len, &local_err);
+    if (ret < 0) {
+        error_propagate_prepend(errp, local_err, "nvme_ns_blk_resize: ");
+        return ret;
+    }
+
+    return 0;
 }
 
 static int nvme_ns_init_blk(NvmeCtrl *n, NvmeNamespace *ns, NvmeIdCtrl *id,
@@ -111,6 +200,19 @@ int nvme_ns_setup(NvmeCtrl *n, NvmeNamespace *ns, Error **errp)
     }
 
     nvme_ns_init(ns);
+
+    if (ns->blk_state) {
+        if (nvme_ns_init_blk_state(ns, errp)) {
+            return -1;
+        }
+
+        /*
+         * With a state file in place we can enable the Deallocated or
+         * Unwritten Logical Block Error feature.
+         */
+        ns->id_ns.nsfeat |= 0x4;
+    }
+
     if (nvme_register_namespace(n, ns, errp)) {
         return -1;
     }
@@ -136,6 +238,7 @@ static Property nvme_ns_props[] = {
     DEFINE_PROP_DRIVE("drive", NvmeNamespace, blk),
     DEFINE_PROP_UINT32("nsid", NvmeNamespace, params.nsid, 0),
     DEFINE_PROP_UINT8("lbads", NvmeNamespace, params.lbads, BDRV_SECTOR_BITS),
+    DEFINE_PROP_DRIVE("state", NvmeNamespace, blk_state),
     DEFINE_PROP_END_OF_LIST(),
 };
 

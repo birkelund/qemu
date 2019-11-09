@@ -93,7 +93,8 @@ typedef enum NvmeAIOOp {
 } NvmeAIOOp;
 
 typedef enum NvmeAIOFlags {
-    NVME_AIO_DMA = 1 << 0,
+    NVME_AIO_DMA      = 1 << 0,
+    NVME_AIO_INTERNAL = 1 << 1,
 } NvmeAIOFlags;
 
 typedef struct NvmeAIO NvmeAIO;
@@ -171,6 +172,7 @@ typedef struct NvmeFeatureVal {
 
 static const uint32_t nvme_feature_cap[0x100] = {
     [NVME_TEMPERATURE_THRESHOLD]    = NVME_FEAT_CAP_CHANGE,
+    [NVME_ERROR_RECOVERY]           = NVME_FEAT_CAP_CHANGE | NVME_FEAT_CAP_NS,
     [NVME_VOLATILE_WRITE_CACHE]     = NVME_FEAT_CAP_CHANGE,
     [NVME_NUMBER_OF_QUEUES]         = NVME_FEAT_CAP_CHANGE,
     [NVME_ASYNCHRONOUS_EVENT_CONF]  = NVME_FEAT_CAP_CHANGE,

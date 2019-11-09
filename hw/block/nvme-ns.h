@@ -27,11 +27,18 @@ typedef struct NvmeNamespaceParams {
 typedef struct NvmeNamespace {
     DeviceState  parent_obj;
     BlockBackend *blk;
+    BlockBackend *blk_state;
     int32_t      bootindex;
     int64_t      size;
 
     NvmeIdNs            id_ns;
     NvmeNamespaceParams params;
+
+    unsigned long *utilization;
+
+    struct {
+        uint32_t err_rec;
+    } features;
 } NvmeNamespace;
 
 static inline uint32_t nvme_nsid(NvmeNamespace *ns)
@@ -58,6 +65,11 @@ static inline uint8_t nvme_ns_lbads(NvmeNamespace *ns)
 static inline uint64_t nvme_ns_nlbas(NvmeNamespace *ns)
 {
     return ns->size >> nvme_ns_lbads(ns);
+}
+
+static inline size_t nvme_ns_blk_state_len(NvmeNamespace *ns)
+{
+    return ROUND_UP(DIV_ROUND_UP(nvme_ns_nlbas(ns), 8), BDRV_SECTOR_SIZE);
 }
 
 typedef struct NvmeCtrl NvmeCtrl;

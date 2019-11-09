@@ -681,6 +681,10 @@ static uint16_t nvme_dma(NvmeCtrl *n, uint8_t *ptr, uint32_t len,
 
 static void nvme_aio_destroy(NvmeAIO *aio)
 {
+    if (aio->flags & NVME_AIO_INTERNAL) {
+        qemu_iovec_destroy((QEMUIOVector *)aio->payload);
+    }
+
     g_free(aio);
 }
 
@@ -915,6 +919,18 @@ static inline uint16_t nvme_check_bounds(NvmeCtrl *n, NvmeNamespace *ns,
     return NVME_SUCCESS;
 }
 
+static inline uint16_t nvme_check_dulbe(NvmeCtrl *n, NvmeNamespace *ns,
+                                        uint64_t slba, uint32_t nlb)
+{
+    uint64_t elba = slba + nlb;
+
+    if (find_next_zero_bit(ns->utilization, elba, slba) < elba) {
+        return NVME_DULB;
+    }
+
+    return NVME_SUCCESS;
+}
+
 static uint16_t nvme_check_rw(NvmeCtrl *n, NvmeRequest *req)
 {
     NvmeNamespace *ns = req->ns;
@@ -934,7 +950,55 @@ static uint16_t nvme_check_rw(NvmeCtrl *n, NvmeRequest *req)
         return status;
     }
 
+    if (!nvme_req_is_write(req) && NVME_ERR_REC_DULBE(ns->features.err_rec)) {
+        status = nvme_check_dulbe(n, ns, req->slba, req->nlb);
+        if (status) {
+            return status;
+        }
+    }
+
     return NVME_SUCCESS;
+}
+
+static void nvme_ns_update_util(NvmeNamespace *ns, uint64_t slba,
+    uint32_t nlb, NvmeRequest *req)
+{
+    int64_t offset = slba >> 3;
+    size_t len = DIV_ROUND_UP(nlb, 8);
+
+    QEMUIOVector *iov = g_new0(QEMUIOVector, 1);
+    NvmeAIO *aio = g_new0(NvmeAIO, 1);
+
+    *aio = (NvmeAIO) {
+        .opc = NVME_AIO_OPC_WRITE,
+        .blk = ns->blk_state,
+        .offset = offset,
+        .len = len,
+        .payload = iov,
+        .req = req,
+        .flags = NVME_AIO_INTERNAL,
+    };
+
+    qemu_iovec_init(iov, 1);
+    qemu_iovec_add(iov, ((uint8_t *) ns->utilization) + offset, len);
+
+    trace_pci_nvme_ns_update_util(nvme_cid(req), nvme_nsid(ns));
+
+    nvme_req_add_aio(req, aio);
+}
+
+static void nvme_aio_write_cb(NvmeAIO *aio, void *opaque, int ret)
+{
+    NvmeRequest *req = aio->req;
+    NvmeNamespace *ns = req->ns;
+
+    trace_pci_nvme_aio_write_cb(nvme_cid(req), nvme_nsid(ns), req->slba,
+        req->nlb);
+
+    if (!ret && ns->blk_state) {
+        bitmap_set(ns->utilization, req->slba, req->nlb);
+        nvme_ns_update_util(ns, req->slba, req->nlb, req);
+    }
 }
 
 static void nvme_rw_cb(NvmeRequest *req, void *opaque)
@@ -1025,7 +1089,8 @@ static void nvme_aio_cb(void *opaque, int ret)
     nvme_aio_destroy(aio);
 }
 
-static void nvme_aio_rw(NvmeNamespace *ns, NvmeAIOOp opc, NvmeRequest *req)
+static void nvme_aio_rw(NvmeNamespace *ns, NvmeAIOOp opc,
+                        NvmeAIOCompletionFunc *cb, NvmeRequest *req)
 {
     NvmeAIO *aio = g_new(NvmeAIO, 1);
 
@@ -1034,6 +1099,7 @@ static void nvme_aio_rw(NvmeNamespace *ns, NvmeAIOOp opc, NvmeRequest *req)
         .blk = ns->blk,
         .offset = req->slba << nvme_ns_lbads(ns),
         .req = req,
+        .cb = cb,
     };
 
     if (req->qsg.sg) {
@@ -1098,6 +1164,7 @@ static uint16_t nvme_write_zeroes(NvmeCtrl *n, NvmeRequest *req)
         .offset = offset,
         .len = count,
         .req = req,
+        .cb = nvme_aio_write_cb,
     };
 
     nvme_req_add_aio(req, aio);
@@ -1115,10 +1182,12 @@ static uint16_t nvme_rw(NvmeCtrl *n, NvmeRequest *req)
 
     enum BlockAcctType acct = BLOCK_ACCT_READ;
     NvmeAIOOp opc = NVME_AIO_OPC_READ;
+    NvmeAIOCompletionFunc *cb = NULL;
 
     if (nvme_req_is_write(req)) {
         acct = BLOCK_ACCT_WRITE;
         opc = NVME_AIO_OPC_WRITE;
+        cb = nvme_aio_write_cb;
     }
 
     req->nlb  = le16_to_cpu(rw->nlb) + 1;
@@ -1138,7 +1207,7 @@ static uint16_t nvme_rw(NvmeCtrl *n, NvmeRequest *req)
         goto invalid;
     }
 
-    nvme_aio_rw(ns, opc, req);
+    nvme_aio_rw(ns, opc, cb, req);
     nvme_req_set_cb(req, nvme_rw_cb, NULL);
 
     return NVME_NO_COMPLETE;
@@ -1737,6 +1806,8 @@ static uint16_t nvme_get_feature_timestamp(NvmeCtrl *n, NvmeRequest *req)
 
 static uint16_t nvme_get_feature(NvmeCtrl *n, NvmeRequest *req)
 {
+    NvmeNamespace *ns;
+
     NvmeCmd *cmd = &req->cmd;
     uint32_t dw10 = le32_to_cpu(cmd->cdw10);
     uint32_t dw11 = le32_to_cpu(cmd->cdw11);
@@ -1802,6 +1873,18 @@ static uint16_t nvme_get_feature(NvmeCtrl *n, NvmeRequest *req)
             break;
         }
 
+        break;
+    case NVME_ERROR_RECOVERY:
+        if (!nvme_nsid_valid(n, nsid)) {
+            return NVME_INVALID_NSID | NVME_DNR;
+        }
+
+        ns = nvme_ns(n, nsid);
+        if (unlikely(!ns)) {
+            return NVME_INVALID_FIELD | NVME_DNR;
+        }
+
+        result = cpu_to_le32(ns->features.err_rec);
         break;
     case NVME_VOLATILE_WRITE_CACHE:
         result = cpu_to_le32(n->features.vwc);
@@ -1876,7 +1959,7 @@ static uint16_t nvme_set_feature_timestamp(NvmeCtrl *n, NvmeRequest *req)
 
 static uint16_t nvme_set_feature(NvmeCtrl *n, NvmeRequest *req)
 {
-    NvmeNamespace *ns;
+    NvmeNamespace *ns = NULL;
 
     NvmeCmd *cmd = &req->cmd;
     uint32_t dw10 = le32_to_cpu(cmd->cdw10);
@@ -1943,6 +2026,26 @@ static uint16_t nvme_set_feature(NvmeCtrl *n, NvmeRequest *req)
                                NVME_LOG_SMART_INFO);
         }
 
+        break;
+    case NVME_ERROR_RECOVERY:
+        if (nsid == NVME_NSID_BROADCAST) {
+            for (int i = 1; i <= n->num_namespaces; i++) {
+                ns = nvme_ns(n, i);
+
+                if (!ns) {
+                    continue;
+                }
+
+                if (NVME_ID_NS_NSFEAT_DULBE(ns->id_ns.nsfeat)) {
+                    ns->features.err_rec = dw11;
+                }
+            }
+
+            break;
+        }
+
+        assert(ns);
+        ns->features.err_rec = dw11;
         break;
     case NVME_VOLATILE_WRITE_CACHE:
         n->features.vwc = dw11 & 0x1;
@@ -2091,6 +2194,10 @@ static void nvme_clear_ctrl(NvmeCtrl *n)
         }
 
         blk_drain(ns->blk);
+
+        if (ns->blk_state) {
+            blk_drain(ns->blk_state);
+        }
     }
 
     for (i = 0; i < n->params.max_ioqpairs + 1; i++) {
@@ -2121,6 +2228,10 @@ static void nvme_clear_ctrl(NvmeCtrl *n)
         }
 
         blk_flush(ns->blk);
+
+        if (ns->blk_state) {
+            blk_flush(ns->blk_state);
+        }
     }
 
     n->bar.cc = 0;
