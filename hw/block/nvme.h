@@ -18,6 +18,31 @@ typedef struct NvmeParams {
     bool     use_intel_id;
 } NvmeParams;
 
+static const NvmeEffectsLog nvme_effects = {
+    .acs = {
+        [NVME_ADM_CMD_DELETE_SQ]    = NVME_EFFECTS_CSUPP,
+        [NVME_ADM_CMD_CREATE_SQ]    = NVME_EFFECTS_CSUPP,
+        [NVME_ADM_CMD_GET_LOG_PAGE] = NVME_EFFECTS_CSUPP,
+        [NVME_ADM_CMD_DELETE_CQ]    = NVME_EFFECTS_CSUPP,
+        [NVME_ADM_CMD_CREATE_CQ]    = NVME_EFFECTS_CSUPP,
+        [NVME_ADM_CMD_IDENTIFY]     = NVME_EFFECTS_CSUPP,
+        [NVME_ADM_CMD_ABORT]        = NVME_EFFECTS_CSUPP,
+        [NVME_ADM_CMD_SET_FEATURES] = NVME_EFFECTS_CSUPP | NVME_EFFECTS_CCC |
+            NVME_EFFECTS_NIC | NVME_EFFECTS_NCC,
+        [NVME_ADM_CMD_GET_FEATURES] = NVME_EFFECTS_CSUPP,
+        [NVME_ADM_CMD_FORMAT_NVM]   = NVME_EFFECTS_CSUPP | NVME_EFFECTS_LBCC |
+            NVME_EFFECTS_NCC | NVME_EFFECTS_NIC | NVME_EFFECTS_CSE_MULTI,
+        [NVME_ADM_CMD_ASYNC_EV_REQ] = NVME_EFFECTS_CSUPP,
+    },
+
+    .iocs = {
+        [NVME_CMD_FLUSH]            = NVME_EFFECTS_CSUPP,
+        [NVME_CMD_WRITE]            = NVME_EFFECTS_CSUPP | NVME_EFFECTS_LBCC,
+        [NVME_CMD_READ]             = NVME_EFFECTS_CSUPP,
+        [NVME_CMD_WRITE_ZEROES]     = NVME_EFFECTS_CSUPP | NVME_EFFECTS_LBCC,
+    },
+};
+
 typedef struct NvmeAsyncEvent {
     QTAILQ_ENTRY(NvmeAsyncEvent) entry;
     NvmeAerResult result;
